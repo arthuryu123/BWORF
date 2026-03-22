@@ -1,0 +1,3708 @@
+--- /mnt/data/bworf_with_mi_backup.py	2026-03-06 16:00:23.013316372 +0000
++++ /mnt/data/bworf_with_mi_patched.py	2026-03-06 16:13:48.545269784 +0000
+@@ -1,1786 +1,1918 @@
+-import numpy as np
+-import matplotlib.pyplot as plt
+-from sklearn.datasets import make_classification
+-from sklearn.model_selection import train_test_split, StratifiedKFold
+-from sklearn.ensemble import RandomForestClassifier
+-from sklearn.linear_model import LogisticRegression
+-from sklearn.utils.class_weight import compute_sample_weight
+-from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix, ConfusionMatrixDisplay, 
+-                           roc_curve, auc, roc_auc_score, matthews_corrcoef, precision_score, recall_score)
+-from sklearn.preprocessing import LabelBinarizer
+-from sklearn.feature_selection import mutual_info_classif
+-from collections import Counter
+-from scipy import stats
+-import warnings
+-warnings.filterwarnings('ignore')
+-
+-# Toggle variable to control whether MI filtering is applied
+-use_mi_filter = True
+-
+-# Keep the top K features (defined at the top)
+-top_k = 100
+-
+-def generate_rotated_dataset():
+-    """
+-    Generate synthetic dataset with oblique decision boundaries for DILI classification.
+-    
+-    Returns:
+-        X_rotated: Rotated feature matrix (1200 x 10)
+-        y: Target labels (6 classes representing DILI risk categories)
+-    """
+-    print("Generating base synthetic dataset...")
+-    
+-    # Generate base dataset with specified parameters
+-    X, y = make_classification(
+-        n_samples=1200, 
+-        n_features=10, 
+-        n_classes=6,
+-        n_informative=8,  # Need enough informative features for 6 classes
+-        n_redundant=1,
+-        n_clusters_per_class=1,
+-        class_sep=1.5,
+-        flip_y=0.01,
+-        random_state=42
+-    )
+-    
+-    print("Applying random rotation using QR decomposition...")
+-    
+-    # Apply random rotation using QR decomposition to introduce oblique boundaries
+-    np.random.seed(42)
+-    random_matrix = np.random.randn(10, 10)
+-    Q, R = np.linalg.qr(random_matrix)
+-    X_rotated = X @ Q
+-    
+-    return X_rotated, y
+-
+-
+-class ObliqueDecisionTreeMulti:
+-    """
+-    Bootstrap and Weighted Oblique Decision Tree for multiclass classification.
+-    
+-    Uses L1-regularized logistic regression for learned oblique splits with balanced class weights.
+-    """
+-    
+-    def __init__(self, max_depth=5, min_samples_split=10, min_samples_leaf=5, l1_strength=1.0, 
+-                 random_state=None, debug_trace=False, debug_max_nodes=3, n_tries=2):
+-        """
+-        Initialize oblique decision tree with L1-regularized splits.
+-        
+-        Args:
+-            max_depth: Maximum tree depth
+-            min_samples_split: Minimum samples required to split
+-            min_samples_leaf: Minimum samples in leaf nodes
+-            l1_strength: L1 regularization strength (higher = more sparse)
+-            random_state: Random seed for reproducibility
+-            debug_trace: Enable debug trace mode for verification
+-            debug_max_nodes: Maximum number of nodes to trace in debug mode
+-            n_tries: Number of random binary split attempts per node (default=2)
+-        """
+-        self.max_depth = max_depth
+-        self.min_samples_split = min_samples_split
+-        self.min_samples_leaf = min_samples_leaf
+-        self.l1_strength = l1_strength
+-        self.random_state = random_state
+-        self.debug_trace = debug_trace
+-        self.debug_max_nodes = debug_max_nodes
+-        self.n_tries = n_tries
+-        self.tree = None
+-        self.n_classes_ = None  # Will be set during fit
+-        self._debug_node_counter = 0  # Counter for debug trace
+-        self._l1_warning_issued = False  # Track if we've warned about invalid l1_strength
+-        
+-    def compute_node_weights(self, y, class_weight_mode="balanced", normalize=True):
+-        """
+-        Compute explicit per-sample weights ω_i^(t) for a node.
+-        
+-        Args:
+-            y: Target labels for samples in this node
+-            class_weight_mode: "balanced" for inverse frequency weighting
+-            normalize: If True, normalize weights to sum=1 (for Gini); 
+-                      If False, return raw weights (for LogisticRegression)
+-            
+-        Returns:
+-            weights: Raw or normalized sample weights
+-        """
+-        n_samples = len(y)
+-        if n_samples == 0:
+-            return np.array([])
+-        
+-        unique_classes, class_counts = np.unique(y, return_counts=True)
+-        n_classes = len(unique_classes)
+-        
+-        # Compute class weights: w_class[k] = n_samples / (n_classes * count_k)
+-        class_weights_dict = {}
+-        for cls, count in zip(unique_classes, class_counts):
+-            if class_weight_mode == "balanced":
+-                class_weights_dict[cls] = n_samples / (n_classes * count)
+-            else:
+-                class_weights_dict[cls] = 1.0  # Uniform weights
+-        
+-        # Assign weights to samples based on their class
+-        weights = np.array([class_weights_dict[label] for label in y])
+-        
+-        # Normalize to sum to 1.0 if requested
+-        if normalize:
+-            weights = weights / weights.sum()
+-            
+-            # Verification in debug mode
+-            if self.debug_trace and abs(weights.sum() - 1.0) > 1e-8:
+-                raise ValueError(f"Weights do not sum to 1.0: {weights.sum()}")
+-        
+-        return weights
+-    
+-    def _gini_impurity(self, y, weights=None):
+-        """
+-        Calculate Gini impurity for multiclass classification.
+-        
+-        Args:
+-            y: Target labels
+-            weights: Optional sample weights (if None, uniform weights)
+-            
+-        Returns:
+-            Gini impurity score
+-        """
+-        if len(y) == 0:
+-            return 0
+-        
+-        n_classes = self.n_classes_ if self.n_classes_ is not None else len(np.unique(y))
+-        
+-        if weights is None:
+-            # Unweighted version
+-            counts = np.bincount(y, minlength=n_classes)
+-            probabilities = counts / len(y)
+-        else:
+-            # Weighted version
+-            probabilities = np.zeros(n_classes)
+-            for cls in range(n_classes):
+-                mask = (y == cls)
+-                probabilities[cls] = weights[mask].sum()
+-        
+-        # Gini = 1 - sum(p_i^2)
+-        return 1 - np.sum(probabilities ** 2)
+-    
+-    def _find_best_split_logistic(self, X, y, rng, node_weights_raw=None, node_weights_norm=None):
+-        """
+-        Find best oblique split using L1-regularized logistic regression with CART-style threshold optimization.
+-        
+-        Args:
+-            X: Feature matrix for this node
+-            y: Target labels for this node
+-            rng: Random number generator
+-            node_weights_raw: Raw per-sample weights (for LogisticRegression, sum ≈ n_samples)
+-            node_weights_norm: Normalized per-sample weights (for Gini, sum=1)
+-            
+-        Returns:
+-            best_w: Best projection vector from logistic regression
+-            best_threshold: Best threshold value (from CART scan)
+-            best_gini: Best weighted Gini impurity after split
+-        """
+-        n_samples, n_features = X.shape
+-        
+-        # Check if split is possible
+-        if len(np.unique(y)) <= 1:
+-            return None, None, None
+-            
+-        # Check minimum samples constraints
+-        if n_samples < self.min_samples_split:
+-            return None, None, None
+-        
+-        # Compute explicit node weights if not provided
+-        if node_weights_raw is None:
+-            node_weights_raw = self.compute_node_weights(y, class_weight_mode="balanced", normalize=False)
+-        if node_weights_norm is None:
+-            node_weights_norm = self.compute_node_weights(y, class_weight_mode="balanced", normalize=True)
+-        
+-        best_w, best_threshold, best_gini = None, None, float('inf')
+-        current_gini = self._gini_impurity(y, weights=node_weights_norm)
+-        
+-        # Debug trace for this node
+-        should_debug = (self.debug_trace and self._debug_node_counter < self.debug_max_nodes)
+-        
+-        if should_debug:
+-            print(f"      [DEBUG] Using n_tries={self.n_tries} for this node")
+-        
+-        # Try multiple random binary groupings for oblique splits
+-        for attempt in range(self.n_tries):
+-            try:
+-                # Create random binary split of the classes for this attempt
+-                unique_classes = np.unique(y)
+-                if len(unique_classes) == 2:
+-                    # Already binary, use as-is
+-                    binary_y = y.copy()
+-                else:
+-                    # Randomly split classes into two groups
+-                    rng.shuffle(unique_classes)
+-                    mid_point = len(unique_classes) // 2
+-                    if mid_point == 0:
+-                        mid_point = 1
+-                    
+-                    group_0_classes = unique_classes[:mid_point]
+-                    group_1_classes = unique_classes[mid_point:]
+-                    
+-                    # Convert multiclass to binary
+-                    binary_y = np.zeros(len(y), dtype=int)
+-                    for cls in group_1_classes:
+-                        binary_y[y == cls] = 1
+-                
+-                # Skip if the binary split is too imbalanced
+-                if np.sum(binary_y == 0) < self.min_samples_leaf or np.sum(binary_y == 1) < self.min_samples_leaf:
+-                    continue
+-                
+-                # Use RAW weights for LogisticRegression (not normalized)
+-                # This prevents the sum=1 normalization from affecting effective regularization
+-                sample_weights_for_lr = node_weights_raw.copy()
+-                
+-                # Define L1-regularized logistic regression for binary classification
+-                # Guard against l1_strength <= 0 to prevent division by zero
+-                if self.l1_strength is None or self.l1_strength <= 0:
+-                    # Use large C (approximates no regularization) when l1_strength is invalid
+-                    C = 1e6
+-                    if not self._l1_warning_issued:
+-                        print(f"  [WARNING] Invalid l1_strength={self.l1_strength} supplied; "
+-                              f"using large C={C:.0e} approximation (no regularization).")
+-                        self._l1_warning_issued = True
+-                else:
+-                    C = 1.0 / self.l1_strength  # Convert strength to sklearn's C parameter
+-                
+-                clf = LogisticRegression(
+-                    penalty='l1',
+-                    solver='liblinear',  # Better for L1 with binary classification
+-                    max_iter=1000,
+-                    C=C,
+-                    random_state=None if self.random_state is None else self.random_state + attempt,
+-                    fit_intercept=True
+-                )
+-                
+-                # Fit the binary classifier with explicit sample weights
+-                clf.fit(X, binary_y, sample_weight=sample_weights_for_lr)
+-                
+-                # Extract projection vector w
+-                if hasattr(clf, 'coef_') and clf.coef_ is not None:
+-                    w = clf.coef_.flatten()
+-                    
+-                    # Check if w is all zeros (fallback case)
+-                    if np.all(np.abs(w) < 1e-10):
+-                        if should_debug:
+-                            print(f"      [DEBUG] Attempt {attempt+1}: All-zero coefficients, skipping")
+-                        continue
+-                    
+-                    # Compute projection z = X @ w
+-                    z = X @ w
+-                    
+-                    # Check if z has sufficient unique values for threshold optimization
+-                    unique_z = np.unique(z)
+-                    if len(unique_z) < 2:
+-                        if should_debug:
+-                            print(f"      [DEBUG] Attempt {attempt+1}: Insufficient unique z values ({len(unique_z)}), skipping")
+-                        continue
+-                    
+-                    # CART-style threshold optimization along projection z
+-                    # Sort z, y, and weights by z
+-                    sorted_indices = np.argsort(z)
+-                    z_sorted = z[sorted_indices]
+-                    y_sorted = y[sorted_indices]
+-                    w_sorted = node_weights_norm[sorted_indices]
+-                    
+-                    # Candidate thresholds: midpoints between consecutive unique z values
+-                    candidate_thresholds = []
+-                    for i in range(len(unique_z) - 1):
+-                        threshold_candidate = (unique_z[i] + unique_z[i+1]) / 2.0
+-                        candidate_thresholds.append(threshold_candidate)
+-                    
+-                    # Evaluate each candidate threshold
+-                    best_c_for_this_w = None
+-                    best_gini_for_this_w = float('inf')
+-                    
+-                    # Also compute intercept-based threshold for comparison
+-                    if hasattr(clf, 'intercept_') and clf.intercept_ is not None:
+-                        if isinstance(clf.intercept_, np.ndarray):
+-                            intercept_threshold = -clf.intercept_[0]
+-                        else:
+-                            intercept_threshold = -clf.intercept_
+-                    else:
+-                        intercept_threshold = 0.0
+-                    
+-                    for c_candidate in candidate_thresholds:
+-                        left_mask = z <= c_candidate
+-                        right_mask = ~left_mask
+-                        
+-                        # Check minimum samples constraint
+-                        if (np.sum(left_mask) < self.min_samples_leaf or 
+-                            np.sum(right_mask) < self.min_samples_leaf):
+-                            continue
+-                        
+-                        # Calculate weighted Gini impurity on original multiclass labels
+-                        # Use NORMALIZED weights for Gini computation
+-                        y_left = y[left_mask]
+-                        y_right = y[right_mask]
+-                        w_left = node_weights_norm[left_mask]
+-                        w_right = node_weights_norm[right_mask]
+-                        
+-                        # Normalize weights for each side
+-                        W_left = w_left.sum()
+-                        W_right = w_right.sum()
+-                        
+-                        if W_left > 0:
+-                            w_left_norm = w_left / W_left
+-                        else:
+-                            w_left_norm = w_left
+-                        
+-                        if W_right > 0:
+-                            w_right_norm = w_right / W_right
+-                        else:
+-                            w_right_norm = w_right
+-                        
+-                        left_gini = self._gini_impurity(y_left, weights=w_left_norm)
+-                        right_gini = self._gini_impurity(y_right, weights=w_right_norm)
+-                        
+-                        # Total weighted Gini
+-                        weighted_gini = W_left * left_gini + W_right * right_gini
+-                        
+-                        if weighted_gini < best_gini_for_this_w:
+-                            best_c_for_this_w = c_candidate
+-                            best_gini_for_this_w = weighted_gini
+-                    
+-                    # If no valid threshold found via CART scan, skip this attempt
+-                    if best_c_for_this_w is None:
+-                        if should_debug:
+-                            print(f"      [DEBUG] Attempt {attempt+1}: No valid CART threshold found, skipping")
+-                        continue
+-                    
+-                    # Keep the best split found so far across all attempts
+-                    if best_gini_for_this_w < best_gini and best_gini_for_this_w < current_gini:
+-                        best_w = w.copy()
+-                        best_threshold = best_c_for_this_w
+-                        best_gini = best_gini_for_this_w
+-                        
+-                        # Debug: print info
+-                        non_zero_features = np.sum(np.abs(w) > 1e-10)
+-                        if should_debug:
+-                            print(f"      [DEBUG] Attempt {attempt+1}: {non_zero_features}/{n_features} non-zero features")
+-                            print(f"      [DEBUG]   Intercept threshold: {intercept_threshold:.4f}, CART threshold: {best_c_for_this_w:.4f}")
+-                            print(f"      [DEBUG]   Weighted Gini: {best_gini_for_this_w:.4f} (before: {current_gini:.4f})")
+-                        else:
+-                            print(f"    Node split attempt {attempt+1}: {non_zero_features}/{n_features} non-zero features, Gini: {best_gini_for_this_w:.4f}")
+-                        
+-            except Exception as e:
+-                print(f"    Warning: Logistic regression attempt {attempt+1} failed: {e}")
+-                continue
+-        
+-        return best_w, best_threshold, best_gini
+-    
+-    def _build_tree(self, X, y, depth, rng):
+-        """
+-        Recursively build the oblique decision tree using L1-regularized splits with explicit node weights.
+-        
+-        Args:
+-            X: Feature matrix
+-            y: Target labels
+-            depth: Current depth
+-            rng: Random number generator
+-            
+-        Returns:
+-            Node dictionary representing the tree structure
+-        """
+-        # Compute explicit node weights ω_i^(t) - both raw and normalized
+-        node_weights_raw = self.compute_node_weights(y, class_weight_mode="balanced", normalize=False)
+-        node_weights_norm = self.compute_node_weights(y, class_weight_mode="balanced", normalize=True)
+-        
+-        # Create node with basic statistics
+-        n_classes = self.n_classes_ if self.n_classes_ is not None else len(np.unique(y))
+-        node = {
+-            'samples': len(y),
+-            'gini': self._gini_impurity(y, weights=node_weights_norm),
+-            'class_counts': np.bincount(y, minlength=n_classes),
+-            'predicted_class': np.argmax(np.bincount(y, minlength=n_classes))
+-        }
+-        
+-        # Debug trace for this node
+-        should_debug = (self.debug_trace and self._debug_node_counter < self.debug_max_nodes)
+-        
+-        if should_debug:
+-            print(f"\n    [DEBUG NODE {self._debug_node_counter}] Depth: {depth}, Samples: {len(y)}")
+-            print(f"    [DEBUG] Normalized weight summary: sum={node_weights_norm.sum():.6f}, min={node_weights_norm.min():.6f}, max={node_weights_norm.max():.6f}, mean={node_weights_norm.mean():.6f}")
+-            print(f"    [DEBUG] Raw weight summary: sum={node_weights_raw.sum():.2f}, min={node_weights_raw.min():.6f}, max={node_weights_raw.max():.6f}")
+-            for cls in range(n_classes):
+-                mask = (y == cls)
+-                if mask.any():
+-                    print(f"    [DEBUG]   sum(ω_norm[y=={cls}]) = {node_weights_norm[mask].sum():.6f}, sum(ω_raw[y=={cls}]) = {node_weights_raw[mask].sum():.2f}")
+-            print(f"    [DEBUG] Gini (weighted): {node['gini']:.4f}")
+-            self._debug_node_counter += 1
+-        else:
+-            print(f"    Building node at depth {depth}, samples: {len(y)}, gini: {node['gini']:.4f}")
+-        
+-        # Check stopping criteria
+-        # Note: max_depth=None means unlimited depth, so only check if it's set
+-        if ((self.max_depth is not None and depth >= self.max_depth) or 
+-            len(y) < self.min_samples_split or 
+-            len(np.unique(y)) <= 1 or
+-            node['gini'] < 1e-10):
+-            node['is_leaf'] = True
+-            print(f"    -> Leaf node (depth={depth}, samples={len(y)})")
+-            return node
+-        
+-        # Find best oblique split using logistic regression with CART-style threshold optimization
+-        w, threshold, gini = self._find_best_split_logistic(X, y, rng, node_weights_raw=node_weights_raw, node_weights_norm=node_weights_norm)
+-        
+-        if w is None:  # No valid split found
+-            node['is_leaf'] = True
+-            print(f"    -> Leaf node (no valid split found)")
+-            return node
+-        
+-        # Apply split and create child nodes
+-        z = X @ w
+-        left_mask = z <= threshold  # Use <= for consistency
+-        right_mask = ~left_mask
+-        
+-        # Ensure both children have minimum samples
+-        if (np.sum(left_mask) < self.min_samples_leaf or 
+-            np.sum(right_mask) < self.min_samples_leaf):
+-            node['is_leaf'] = True
+-            print(f"    -> Leaf node (insufficient samples in children)")
+-            return node
+-        
+-        # Store split information and recursively build children
+-        node['is_leaf'] = False
+-        node['projection'] = w
+-        node['threshold'] = threshold
+-        
+-        if should_debug:
+-            print(f"    [DEBUG] Split chosen: threshold={threshold:.4f}, gini_after={gini:.4f}")
+-            gini_improvement = node['gini'] - gini
+-            print(f"    [DEBUG] Gini improvement: {gini_improvement:.4f}")
+-        
+-        print(f"    -> Split node: {np.sum(left_mask)} left, {np.sum(right_mask)} right")
+-        
+-        node['left'] = self._build_tree(X[left_mask], y[left_mask], depth + 1, rng)
+-        node['right'] = self._build_tree(X[right_mask], y[right_mask], depth + 1, rng)
+-        
+-        return node
+-    
+-    def fit(self, X, y):
+-        """
+-        Train the oblique decision tree using L1-regularized logistic regression splits.
+-        
+-        Args:
+-            X: Training feature matrix
+-            y: Training target labels
+-            
+-        Returns:
+-            self
+-        """
+-        print(f"  Training oblique tree with L1 strength: {self.l1_strength}")
+-        
+-        # Set number of classes dynamically
+-        self.n_classes_ = len(np.unique(y))
+-        print(f"  Detected {self.n_classes_} classes")
+-        
+-        # Reset debug node counter
+-        self._debug_node_counter = 0
+-        
+-        rng = np.random.RandomState(self.random_state)
+-        self.tree = self._build_tree(X, y, 0, rng)
+-        return self
+-    
+-    def _predict_sample(self, x, node):
+-        """
+-        Predict class for a single sample by traversing the tree.
+-        
+-        Args:
+-            x: Single sample feature vector
+-            node: Current tree node
+-            
+-        Returns:
+-            Predicted class label
+-        """
+-        if node['is_leaf']:
+-            return node['predicted_class']
+-        
+-        # Apply learned oblique projection and threshold: w^T x <= c (consistent with training)
+-        z = x @ node['projection']
+-        
+-        if z <= node['threshold']:
+-            return self._predict_sample(x, node['left'])
+-        else:
+-            return self._predict_sample(x, node['right'])
+-    
+-    def predict(self, X):
+-        """
+-        Predict classes for multiple samples.
+-        
+-        Args:
+-            X: Feature matrix for prediction
+-            
+-        Returns:
+-            Array of predicted class labels
+-        """
+-        if self.tree is None:
+-            raise ValueError("Tree not fitted. Call fit() first.")
+-        
+-        return np.array([self._predict_sample(x, self.tree) for x in X])
+-    
+-    def _predict_proba_sample(self, x, node):
+-        """
+-        Predict class probabilities for a single sample by traversing the tree.
+-        
+-        Args:
+-            x: Single sample feature vector
+-            node: Current tree node
+-            
+-        Returns:
+-            Array of class probabilities
+-        """
+-        if node['is_leaf']:
+-            # Return normalized class probabilities from leaf node
+-            total_samples = np.sum(node['class_counts'])
+-            n_classes = self.n_classes_ if self.n_classes_ is not None else len(node['class_counts'])
+-            if total_samples == 0:
+-                return np.ones(n_classes) / n_classes  # Uniform distribution if no samples
+-            return node['class_counts'] / total_samples
+-        
+-        # Apply learned oblique projection and threshold: w^T x <= c (consistent with training)
+-        z = x @ node['projection']
+-        
+-        if z <= node['threshold']:
+-            return self._predict_proba_sample(x, node['left'])
+-        else:
+-            return self._predict_proba_sample(x, node['right'])
+-    
+-    def predict_proba(self, X):
+-        """
+-        Predict class probabilities for multiple samples.
+-        
+-        Args:
+-            X: Feature matrix for prediction
+-            
+-        Returns:
+-            Array of shape (n_samples, n_classes) with class probabilities
+-        """
+-        if self.tree is None:
+-            raise ValueError("Tree not fitted. Call fit() first.")
+-        
+-        return np.array([self._predict_proba_sample(x, self.tree) for x in X])
+-
+-
+-class ObliqueRandomForestMulti:
+-    """
+-    Bootstrap and Weighted Oblique Random Forest for multiclass classification.
+-    
+-    Ensemble of oblique decision trees using bootstrap sampling, L1-regularized splits, and majority voting.
+-    """
+-    
+-    def __init__(self, n_estimators=100, max_depth=5, min_samples_split=10, 
+-                 min_samples_leaf=5, l1_strength=1.0, random_state=None,
+-                 debug_trace=False, debug_max_nodes=3,
+-                 weighted_bootstrap=False, bootstrap_weight_mode="balanced", 
+-                 bootstrap_temperature=1.0, n_tries=2):
+-        """
+-        Initialize bootstrap and weighted oblique random forest.
+-        
+-        Args:
+-            n_estimators: Number of trees in the forest
+-            max_depth: Maximum depth of each tree
+-            min_samples_split: Minimum samples required to split
+-            min_samples_leaf: Minimum samples in leaf nodes
+-            l1_strength: L1 regularization strength for oblique splits
+-            random_state: Random seed for reproducibility
+-            debug_trace: Enable debug trace mode (only for first tree)
+-            debug_max_nodes: Maximum number of nodes to trace in debug mode
+-            weighted_bootstrap: If True, use non-uniform bootstrap sampling based on class weights
+-            bootstrap_weight_mode: Mode for computing bootstrap weights ("balanced" for now)
+-            bootstrap_temperature: Temperature for sharpening/flattening bootstrap probabilities
+-            n_tries: Number of random binary split attempts per node (default=2)
+-        """
+-        self.n_estimators = n_estimators
+-        self.max_depth = max_depth
+-        self.min_samples_split = min_samples_split
+-        self.min_samples_leaf = min_samples_leaf
+-        self.l1_strength = l1_strength
+-        self.random_state = random_state
+-        self.debug_trace = debug_trace
+-        self.debug_max_nodes = debug_max_nodes
+-        self.weighted_bootstrap = weighted_bootstrap
+-        self.bootstrap_weight_mode = bootstrap_weight_mode
+-        self.bootstrap_temperature = bootstrap_temperature
+-        self.n_tries = n_tries
+-        self.trees = []
+-    
+-    def fit(self, X, y):
+-        """
+-        Train the bootstrap and weighted oblique random forest.
+-        
+-        Args:
+-            X: Training feature matrix
+-            y: Training target labels
+-            
+-        Returns:
+-            self
+-        """
+-        rng = np.random.RandomState(self.random_state)
+-        self.trees = []
+-        
+-        n_samples = len(X)
+-        
+-        print(f"Training {self.n_estimators} oblique trees with L1 regularization...")
+-        
+-        # Compute bootstrap sampling probabilities if weighted_bootstrap is enabled
+-        bootstrap_probs = None
+-        if self.weighted_bootstrap:
+-            if self.bootstrap_weight_mode == "balanced":
+-                # Compute per-sample class-balanced weights
+-                unique_classes, class_counts = np.unique(y, return_counts=True)
+-                n_classes = len(unique_classes)
+-                
+-                # Create class weight dictionary
+-                class_weights_dict = {}
+-                for cls, count in zip(unique_classes, class_counts):
+-                    class_weights_dict[cls] = n_samples / (n_classes * count)
+-                
+-                # Assign weights to each sample
+-                sample_weights = np.array([class_weights_dict[label] for label in y])
+-                
+-                # Apply temperature and normalize to probabilities
+-                sample_weights_temp = sample_weights ** self.bootstrap_temperature
+-                bootstrap_probs = sample_weights_temp / sample_weights_temp.sum()
+-                
+-                # Debug trace for weighted bootstrap
+-                if self.debug_trace:
+-                    print(f"\n[DEBUG WEIGHTED BOOTSTRAP]")
+-                    print(f"  Mode: {self.bootstrap_weight_mode}, Temperature: {self.bootstrap_temperature}")
+-                    print(f"  Class counts: {dict(zip(unique_classes, class_counts))}")
+-                    print(f"  Bootstrap probabilities: sum={bootstrap_probs.sum():.6f}, min={bootstrap_probs.min():.6f}, max={bootstrap_probs.max():.6f}, mean={bootstrap_probs.mean():.6f}")
+-                    for cls in unique_classes:
+-                        mask = (y == cls)
+-                        print(f"    Class {cls}: mean_prob={bootstrap_probs[mask].mean():.6f}, sum_prob={bootstrap_probs[mask].sum():.6f}")
+-        
+-        for i in range(self.n_estimators):
+-            print(f"\nTraining tree {i+1}/{self.n_estimators}")
+-            
+-            # Bootstrap sampling with replacement
+-            if self.weighted_bootstrap and bootstrap_probs is not None:
+-                # Non-uniform weighted bootstrap
+-                bootstrap_indices = rng.choice(n_samples, size=n_samples, replace=True, p=bootstrap_probs)
+-            else:
+-                # Standard uniform bootstrap
+-                bootstrap_indices = rng.choice(n_samples, size=n_samples, replace=True)
+-            
+-            X_bootstrap = X[bootstrap_indices]
+-            y_bootstrap = y[bootstrap_indices]
+-            
+-            # Enable debug trace only for the first tree
+-            enable_debug = (i == 0) and self.debug_trace
+-            
+-            # Train individual oblique tree with L1-regularized splits
+-            tree = ObliqueDecisionTreeMulti(
+-                max_depth=self.max_depth,
+-                min_samples_split=self.min_samples_split,
+-                min_samples_leaf=self.min_samples_leaf,
+-                l1_strength=self.l1_strength,
+-                random_state=rng.randint(0, 100000),
+-                debug_trace=enable_debug,
+-                debug_max_nodes=self.debug_max_nodes,
+-                n_tries=self.n_tries
+-            )
+-            
+-            tree.fit(X_bootstrap, y_bootstrap)
+-            self.trees.append(tree)
+-            
+-            # Progress indicator
+-            if (i + 1) % 5 == 0:
+-                print(f"  Completed {i + 1}/{self.n_estimators} trees")
+-        
+-        return self
+-    
+-    def predict(self, X):
+-        """
+-        Predict using majority vote from all trees.
+-        
+-        Args:
+-            X: Feature matrix for prediction
+-            
+-        Returns:
+-            Array of predicted class labels
+-        """
+-        if not self.trees:
+-            raise ValueError("Forest not fitted. Call fit() first.")
+-        
+-        # Get predictions from all trees
+-        all_predictions = np.array([tree.predict(X) for tree in self.trees])
+-        
+-        # Majority vote for each sample
+-        predictions = []
+-        for i in range(X.shape[0]):
+-            tree_votes = all_predictions[:, i]
+-            vote_counts = Counter(tree_votes)
+-            # Get the most common prediction
+-            majority_class = vote_counts.most_common(1)[0][0]
+-            predictions.append(majority_class)
+-        
+-        return np.array(predictions)
+-    
+-    def predict_proba(self, X):
+-        """
+-        Predict class probabilities using average of all trees.
+-        
+-        Args:
+-            X: Feature matrix for prediction
+-            
+-        Returns:
+-            Array of shape (n_samples, n_classes) with class probabilities
+-        """
+-        if not self.trees:
+-            raise ValueError("Forest not fitted. Call fit() first.")
+-        
+-        # Get probability predictions from all trees and average them
+-        all_probas = np.array([tree.predict_proba(X) for tree in self.trees])
+-        return np.mean(all_probas, axis=0)
+-    
+-    def get_feature_importance(self, X, y, n_repeats=10):
+-        """
+-        Calculate feature importance using permutation importance.
+-        
+-        Args:
+-            X: Feature matrix
+-            y: Target labels
+-            n_repeats: Number of permutation repeats for averaging
+-            
+-        Returns:
+-            feature_importance: Array of importance scores for each feature
+-        """
+-        if not self.trees:
+-            raise ValueError("Forest not fitted. Call fit() first.")
+-        
+-        print("Calculating feature importance using permutation method...")
+-        
+-        # Get baseline accuracy
+-        baseline_acc = accuracy_score(y, self.predict(X))
+-        
+-        n_features = X.shape[1]
+-        importances = np.zeros(n_features)
+-        
+-        # Calculate permutation importance for each feature
+-        for feature_idx in range(n_features):
+-            feature_scores = []
+-            
+-            for repeat in range(n_repeats):
+-                # Create a copy of X and permute the feature
+-                X_permuted = X.copy()
+-                
+-                # Set random seed for reproducible permutation
+-                rng = np.random.RandomState(self.random_state + repeat if self.random_state else None)
+-                X_permuted[:, feature_idx] = rng.permutation(X_permuted[:, feature_idx])
+-                
+-                # Calculate accuracy with permuted feature
+-                permuted_acc = accuracy_score(y, self.predict(X_permuted))
+-                
+-                # Importance is the decrease in accuracy
+-                feature_scores.append(baseline_acc - permuted_acc)
+-            
+-            # Average importance across repeats
+-            importances[feature_idx] = np.mean(feature_scores)
+-            
+-            print(f"Feature {feature_idx}: {importances[feature_idx]:.4f}")
+-        
+-        return importances
+-    
+-    def visualize_feature_importance(self, X, y, feature_names=None, n_repeats=10, save_plot=False):
+-        """
+-        Calculate and visualize feature importance.
+-        
+-        Args:
+-            X: Feature matrix
+-            y: Target labels
+-            feature_names: Optional list of feature names
+-            n_repeats: Number of permutation repeats
+-            save_plot: Whether to save the plot as PNG
+-            
+-        Returns:
+-            feature_importance: Array of importance scores
+-        """
+-        # Calculate feature importance
+-        importance = self.get_feature_importance(X, y, n_repeats)
+-        
+-        # Create feature names if not provided
+-        if feature_names is None:
+-            feature_names = [f'Feature {i}' for i in range(len(importance))]
+-        
+-        # Sort features by importance
+-        sorted_indices = np.argsort(importance)[::-1]
+-        sorted_importance = importance[sorted_indices]
+-        sorted_names = [feature_names[i] for i in sorted_indices]
+-        
+-        # Create visualization
+-        plt.figure(figsize=(10, 6))
+-        bars = plt.bar(range(len(sorted_importance)), sorted_importance, color='steelblue', alpha=0.7)
+-        plt.xlabel('Features')
+-        plt.ylabel('Permutation Importance (Accuracy Decrease)')
+-        plt.title('Feature Importance - Bootstrap Weighted Oblique Random Forest')
+-        plt.xticks(range(len(sorted_names)), sorted_names, rotation=45, ha='right')
+-        plt.grid(axis='y', alpha=0.3)
+-        
+-        # Add value labels on bars
+-        for bar, importance_val in zip(bars, sorted_importance):
+-            height = bar.get_height()
+-            plt.text(bar.get_x() + bar.get_width()/2., height + max(sorted_importance)*0.01,
+-                    f'{importance_val:.3f}', ha='center', va='bottom', fontsize=9)
+-        
+-        plt.tight_layout()
+-        
+-        if save_plot:
+-            plt.savefig('bworf_feature_importance.png', dpi=300, bbox_inches='tight')
+-            print("Feature importance plot saved as 'bworf_feature_importance.png'")
+-        else:
+-            plt.show()
+-        
+-        return importance
+-
+-
+-def apply_mutual_information_filtering(X_train, X_test, y_train, top_k_features=None, plot_mi=True):
+-    """
+-    Apply mutual information-based feature filtering.
+-    
+-    Args:
+-        X_train: Training feature matrix
+-        X_test: Test feature matrix
+-        y_train: Training target labels
+-        top_k_features: Number of top features to keep (if None, uses global top_k)
+-        plot_mi: Whether to plot the top 20 MI features
+-        
+-    Returns:
+-        X_train_filtered: Filtered training features
+-        X_test_filtered: Filtered test features
+-        selected_feature_indices: Indices of selected features
+-        mi_scores: Mutual information scores for all features
+-    """
+-    if top_k_features is None:
+-        top_k_features = min(top_k, X_train.shape[1])
+-    
+-    print(f"\nApplying Mutual Information-based feature filtering...")
+-    print(f"Original number of features: {X_train.shape[1]}")
+-    print(f"Target number of features: {top_k_features}")
+-    
+-    # Handle NaN values by imputing with median for numerical features
+-    from sklearn.impute import SimpleImputer
+-    print("Checking for and handling missing values...")
+-    
+-    # Check if there are any NaN values
+-    if np.any(np.isnan(X_train)):
+-        print("  Found NaN values, applying median imputation...")
+-        # Use median imputation for numerical features
+-        imputer = SimpleImputer(strategy='median')
+-        X_train_imputed = imputer.fit_transform(X_train)
+-        X_test_imputed = imputer.transform(X_test)
+-        
+-        print(f"  Imputed {np.sum(np.isnan(X_train))} NaN values in training data")
+-        print(f"  Imputed {np.sum(np.isnan(X_test))} NaN values in test data")
+-    else:
+-        print("  No NaN values found")
+-        X_train_imputed = X_train
+-        X_test_imputed = X_test
+-    
+-    # Compute mutual information between each feature and the target y_train
+-    print("Computing mutual information scores...")
+-    mi_scores = mutual_info_classif(X_train_imputed, y_train, random_state=42)
+-    
+-    # Rank features by MI score
+-    feature_rankings = np.argsort(mi_scores)[::-1]  # Descending order
+-    
+-    # Keep the top K features
+-    selected_feature_indices = feature_rankings[:top_k_features]
+-    
+-    # Apply filtering to both X_train and X_test (using imputed data)
+-    X_train_filtered = X_train_imputed[:, selected_feature_indices]
+-    X_test_filtered = X_test_imputed[:, selected_feature_indices]
+-    
+-    print(f"Selected {len(selected_feature_indices)} features based on MI scores")
+-    
+-    # Optionally print the top 20 feature scores
+-    print(f"\nTop 20 features by Mutual Information score:")
+-    for i in range(min(20, len(mi_scores))):
+-        feature_idx = feature_rankings[i]
+-        print(f"  {i+1:2d}. Feature {feature_idx:2d}: MI = {mi_scores[feature_idx]:.4f}")
+-    
+-    # Optionally plot the top 20 MI features using matplotlib
+-    if plot_mi:
+-        plot_mutual_information_scores(mi_scores, feature_rankings, top_features=20)
+-    
+-    return X_train_filtered, X_test_filtered, selected_feature_indices, mi_scores
+-
+-
+-def plot_mutual_information_scores(mi_scores, feature_rankings, top_features=20):
+-    """
+-    Plot the top mutual information features.
+-    
+-    Args:
+-        mi_scores: Array of mutual information scores
+-        feature_rankings: Feature indices sorted by MI score (descending)
+-        top_features: Number of top features to plot
+-    """
+-    print(f"\nGenerating Mutual Information plot for top {top_features} features...")
+-    
+-    # Get top features for plotting
+-    top_indices = feature_rankings[:top_features]
+-    top_scores = mi_scores[top_indices]
+-    feature_names = [f'Feature {i}' for i in top_indices]
+-    
+-    # Create the plot
+-    plt.figure(figsize=(12, 8))
+-    bars = plt.bar(range(len(top_scores)), top_scores, color='darkgreen', alpha=0.7)
+-    
+-    plt.xlabel('Features (Ranked by MI Score)')
+-    plt.ylabel('Mutual Information Score')
+-    plt.title(f'Top {top_features} Features by Mutual Information with Target')
+-    plt.xticks(range(len(feature_names)), feature_names, rotation=45, ha='right')
+-    plt.grid(axis='y', alpha=0.3)
+-    
+-    # Add value labels on bars
+-    for bar, score in zip(bars, top_scores):
+-        height = bar.get_height()
+-        plt.text(bar.get_x() + bar.get_width()/2., height + max(top_scores)*0.01,
+-                f'{score:.3f}', ha='center', va='bottom', fontsize=9)
+-    
+-    plt.tight_layout()
+-    plt.savefig('mutual_information_features.png', dpi=300, bbox_inches='tight')
+-    print("Mutual Information plot saved as 'mutual_information_features.png'")
+-    plt.show()
+-
+-
+-def evaluate_and_visualize(y_test, y_pred_bworf, y_pred_rf, y_proba_bworf, y_proba_rf, acc_bworf, acc_rf, f1_bworf, f1_rf):
+-    """
+-    Generate confusion matrices, ROC curves, and performance visualization.
+-    
+-    Args:
+-        y_test: True test labels
+-        y_pred_bworf: BWORF predictions
+-        y_pred_rf: Standard RF predictions
+-        y_proba_bworf: BWORF class probabilities
+-        y_proba_rf: Standard RF class probabilities
+-        acc_bworf, acc_rf: Accuracy scores
+-        f1_bworf, f1_rf: F1 scores
+-    """
+-    print("\nGenerating confusion matrices...")
+-    
+-    # Create figure with two subplots
+-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+-    
+-    # BWORF confusion matrix
+-    cm_bworf = confusion_matrix(y_test, y_pred_bworf)
+-    disp_bworf = ConfusionMatrixDisplay(
+-        confusion_matrix=cm_bworf, 
+-        display_labels=[f'DILI-{i}' for i in range(6)]
+-    )
+-    disp_bworf.plot(ax=axes[0], cmap='Blues', values_format='d')
+-    bworf_title_suffix = " (with MI Filtering)" if use_mi_filter else ""
+-    axes[0].set_title(f'Bootstrap Weighted Oblique RF{bworf_title_suffix}\nAccuracy: {acc_bworf:.4f} | Macro F1: {f1_bworf:.4f}')
+-    
+-    # Standard RF confusion matrix
+-    cm_rf = confusion_matrix(y_test, y_pred_rf)
+-    disp_rf = ConfusionMatrixDisplay(
+-        confusion_matrix=cm_rf, 
+-        display_labels=[f'DILI-{i}' for i in range(6)]
+-    )
+-    disp_rf.plot(ax=axes[1], cmap='Greens', values_format='d')
+-    axes[1].set_title(f'Standard Random Forest (Original Features)\nAccuracy: {acc_rf:.4f} | Macro F1: {f1_rf:.4f}')
+-    
+-    plt.tight_layout()
+-    plt.show()
+-    
+-    # Generate ROC curves for multiclass classification
+-    print("\nGenerating ROC curves for each class...")
+-    
+-    # Create figure for ROC curves
+-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+-    
+-    class_names = [f'DILI-{i}' for i in range(6)]
+-    colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33']
+-    
+-    # ROC curves for BWORF
+-    mean_auc_bworf = 0
+-    for i in range(6):
+-        y_true_binary = (y_test == i).astype(int)
+-        y_score = y_proba_bworf[:, i]
+-        
+-        fpr, tpr, _ = roc_curve(y_true_binary, y_score)
+-        roc_auc = auc(fpr, tpr)
+-        mean_auc_bworf += roc_auc
+-        
+-        ax1.plot(fpr, tpr, color=colors[i], lw=2, 
+-                label=f'{class_names[i]} (AUC = {roc_auc:.3f})')
+-    
+-    mean_auc_bworf /= 6
+-    ax1.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.8)
+-    ax1.set_xlim([0.0, 1.0])
+-    ax1.set_ylim([0.0, 1.05])
+-    ax1.set_xlabel('False Positive Rate')
+-    ax1.set_ylabel('True Positive Rate')
+-    bworf_roc_title = f'Bootstrap Weighted Oblique RF{bworf_title_suffix} - ROC Curves\nMean AUC = {mean_auc_bworf:.3f}'
+-    ax1.set_title(bworf_roc_title)
+-    ax1.legend(loc="lower right", fontsize=9)
+-    ax1.grid(True, alpha=0.3)
+-    
+-    # ROC curves for Standard RF
+-    mean_auc_rf = 0
+-    for i in range(6):
+-        y_true_binary = (y_test == i).astype(int)
+-        y_score = y_proba_rf[:, i]
+-        
+-        fpr, tpr, _ = roc_curve(y_true_binary, y_score)
+-        roc_auc = auc(fpr, tpr)
+-        mean_auc_rf += roc_auc
+-        
+-        ax2.plot(fpr, tpr, color=colors[i], lw=2, 
+-                label=f'{class_names[i]} (AUC = {roc_auc:.3f})')
+-    
+-    mean_auc_rf /= 6
+-    ax2.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.8)
+-    ax2.set_xlim([0.0, 1.0])
+-    ax2.set_ylim([0.0, 1.05])
+-    ax2.set_xlabel('False Positive Rate')
+-    ax2.set_ylabel('True Positive Rate')
+-    ax2.set_title(f'Standard RF (Original Features) - ROC Curves\nMean AUC = {mean_auc_rf:.3f}')
+-    ax2.legend(loc="lower right", fontsize=9)
+-    ax2.grid(True, alpha=0.3)
+-    
+-    plt.tight_layout()
+-    plt.show()
+-    
+-    # Print detailed performance comparison
+-    print("\n" + "="*60)
+-    print("DETAILED PERFORMANCE ANALYSIS")
+-    print("="*60)
+-    
+-    improvement_acc = ((acc_bworf - acc_rf) / acc_rf) * 100
+-    improvement_f1 = ((f1_bworf - f1_rf) / f1_rf) * 100
+-    improvement_auc = ((mean_auc_bworf - mean_auc_rf) / mean_auc_rf) * 100
+-    
+-    if use_mi_filter:
+-        comparison_description = "Enhanced BWORF (with MI Filtering) vs Standard RF (Original Features)"
+-    else:
+-        comparison_description = "BWORF vs Standard RF (both using Original Features)"
+-    
+-    print(f"Comparison: {comparison_description}")
+-    print(f"Bootstrap Weighted Oblique RF{' (with MI Filtering)' if use_mi_filter else ''}:")
+-    print(f"  - Accuracy:  {acc_bworf:.4f}")
+-    print(f"  - Macro F1:  {f1_bworf:.4f}")
+-    print(f"  - Mean AUC:  {mean_auc_bworf:.4f}")
+-    print(f"\nStandard RF (Original Features):")
+-    print(f"  - Accuracy:  {acc_rf:.4f}")
+-    print(f"  - Macro F1:  {f1_rf:.4f}")
+-    print(f"  - Mean AUC:  {mean_auc_rf:.4f}")
+-    print(f"\nImprovement:")
+-    print(f"  - Accuracy:  {improvement_acc:+.2f}%")
+-    print(f"  - Macro F1:  {improvement_f1:+.2f}%")
+-    print(f"  - Mean AUC:  {improvement_auc:+.2f}%")
+-
+-
+-def visualize_comprehensive_cv_results(bworf_results, rf_results):
+-    """
+-    Create comprehensive visualizations comparing the cross-validation results.
+-    
+-    Args:
+-        bworf_results: Dictionary with BWORF individual scores
+-        rf_results: Dictionary with Standard RF individual scores
+-    """
+-    print("\nGenerating comprehensive comparison visualizations...")
+-    
+-    # Extract data
+-    bworf_acc = bworf_results['accuracies']
+-    bworf_f1 = bworf_results['f1_scores']
+-    bworf_auroc = bworf_results['auroc_scores']
+-    bworf_mcc = bworf_results['mcc_scores']
+-    bworf_precision = bworf_results['precision_scores']
+-    bworf_recall = bworf_results['recall_scores']
+-    
+-    rf_acc = rf_results['accuracies']
+-    rf_f1 = rf_results['f1_scores']
+-    rf_auroc = rf_results['auroc_scores']
+-    rf_mcc = rf_results['mcc_scores']
+-    rf_precision = rf_results['precision_scores']
+-    rf_recall = rf_results['recall_scores']
+-    
+-    # Create comprehensive comparison plots
+-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+-    
+-    # Add comparison description to title
+-    if use_mi_filter:
+-        comparison_title = "Enhanced BWORF (MI Filtered) vs Standard RF (Original)"
+-    else:
+-        comparison_title = "BWORF vs Standard RF (Both Original Features)"
+-    fig.suptitle(f'10-Fold Cross-Validation Results - {comparison_title}', fontsize=16, fontweight='bold')
+-    
+-    # 1. Box plots for all metrics
+-    ax1 = axes[0, 0]
+-    metrics_data = [bworf_acc, rf_acc, bworf_f1, rf_f1, bworf_auroc, rf_auroc]
+-    metrics_labels = ['BWORF\nAccuracy', 'RF\nAccuracy', 'BWORF\nMacro F1', 'RF\nMacro F1', 'BWORF\nAUROC', 'RF\nAUROC']
+-    colors = ['lightblue', 'lightcoral', 'lightgreen', 'orange', 'plum', 'khaki']
+-    
+-    box_plot = ax1.boxplot(metrics_data, labels=metrics_labels, patch_artist=True)
+-    for patch, color in zip(box_plot['boxes'], colors):
+-        patch.set_facecolor(color)
+-    
+-    ax1.set_title('10-Fold CV Performance Distribution\n(Primary Metrics)')
+-    ax1.set_ylabel('Score')
+-    ax1.grid(True, alpha=0.3)
+-    
+-    # 2. Box plots for additional metrics
+-    ax2 = axes[0, 1]
+-    additional_metrics_data = [bworf_mcc, rf_mcc, bworf_precision, rf_precision, bworf_recall, rf_recall]
+-    additional_labels = ['BWORF\nMCC', 'RF\nMCC', 'BWORF\nPrecision', 'RF\nPrecision', 'BWORF\nRecall', 'RF\nRecall']
+-    additional_colors = ['lightsteelblue', 'mistyrose', 'lightcyan', 'peachpuff', 'lavender', 'lemonchiffon']
+-    
+-    box_plot2 = ax2.boxplot(additional_metrics_data, labels=additional_labels, patch_artist=True)
+-    for patch, color in zip(box_plot2['boxes'], additional_colors):
+-        patch.set_facecolor(color)
+-    
+-    ax2.set_title('10-Fold CV Performance Distribution\n(Additional Metrics)')
+-    ax2.set_ylabel('Score')
+-    ax2.grid(True, alpha=0.3)
+-    
+-    # 3. Fold-by-fold accuracy comparison
+-    ax3 = axes[0, 2]
+-    folds = range(1, 11)
+-    ax3.plot(folds, bworf_acc, 'b-o', label='BWORF', linewidth=2, markersize=6)
+-    ax3.plot(folds, rf_acc, 'r-s', label='Standard RF', linewidth=2, markersize=6)
+-    ax3.set_title('Accuracy Across Folds')
+-    ax3.set_xlabel('Fold')
+-    ax3.set_ylabel('Accuracy')
+-    ax3.legend()
+-    ax3.grid(True, alpha=0.3)
+-    
+-    # 4. Fold-by-fold F1 comparison
+-    ax4 = axes[1, 0]
+-    ax4.plot(folds, bworf_f1, 'b-o', label='BWORF', linewidth=2, markersize=6)
+-    ax4.plot(folds, rf_f1, 'r-s', label='Standard RF', linewidth=2, markersize=6)
+-    ax4.set_title('Macro F1 Across Folds')
+-    ax4.set_xlabel('Fold')
+-    ax4.set_ylabel('Macro F1')
+-    ax4.legend()
+-    ax4.grid(True, alpha=0.3)
+-    
+-    # 5. Fold-by-fold AUROC comparison
+-    ax5 = axes[1, 1]
+-    ax5.plot(folds, bworf_auroc, 'b-o', label='BWORF', linewidth=2, markersize=6)
+-    ax5.plot(folds, rf_auroc, 'r-s', label='Standard RF', linewidth=2, markersize=6)
+-    ax5.set_title('AUROC Across Folds')
+-    ax5.set_xlabel('Fold')
+-    ax5.set_ylabel('AUROC')
+-    ax5.legend()
+-    ax5.grid(True, alpha=0.3)
+-    
+-    # 6. Improvement per fold across all metrics
+-    ax6 = axes[1, 2]
+-    acc_improvements = [(b - r) / r * 100 for b, r in zip(bworf_acc, rf_acc)]
+-    f1_improvements = [(b - r) / r * 100 for b, r in zip(bworf_f1, rf_f1)]
+-    auroc_improvements = [(b - r) / r * 100 for b, r in zip(bworf_auroc, rf_auroc)]
+-    mcc_improvements = [(b - r) / r * 100 if r != 0 else 0 for b, r in zip(bworf_mcc, rf_mcc)]
+-    
+-    ax6.plot(folds, acc_improvements, 'g-o', label='Accuracy', linewidth=2, markersize=6)
+-    ax6.plot(folds, f1_improvements, 'b-s', label='Macro F1', linewidth=2, markersize=6)
+-    ax6.plot(folds, auroc_improvements, 'm-^', label='AUROC', linewidth=2, markersize=6)
+-    ax6.plot(folds, mcc_improvements, 'c-d', label='MCC', linewidth=2, markersize=6)
+-    ax6.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+-    ax6.set_title('BWORF Improvement Over Standard RF (%)')
+-    ax6.set_xlabel('Fold')
+-    ax6.set_ylabel('Improvement (%)')
+-    ax6.legend()
+-    ax6.grid(True, alpha=0.3)
+-    
+-    plt.tight_layout()
+-    plt.show()
+-
+-
+-def test_debug_trace(test_weighted_bootstrap=False):
+-    """
+-    Lightweight test to verify debug trace mode and CART-style threshold optimization.
+-    
+-    This test creates a small random dataset and trains a single BWORF tree with debug_trace=True
+-    to verify that:
+-    1. Explicit node weights ω_i^(t) are computed (raw vs normalized)
+-    2. CART-style threshold optimization is performed (not just using -intercept)
+-    3. Debug output is generated for the first few nodes
+-    4. n_tries parameter is correctly wired and used
+-    5. (Optional) Weighted bootstrap sampling is working correctly
+-    
+-    Args:
+-        test_weighted_bootstrap: If True, also test weighted bootstrap mode
+-    """
+-    print("="*90)
+-    print("DEBUG TRACE TEST FOR BWORF")
+-    print("="*90)
+-    print("\nTesting explicit node weights and CART-style threshold optimization...")
+-    
+-    # Create a small random dataset
+-    np.random.seed(42)
+-    X_test = np.random.randn(100, 5)
+-    y_test = np.random.randint(0, 3, size=100)  # 3 classes
+-    
+-    print(f"\nTest dataset: {X_test.shape[0]} samples, {X_test.shape[1]} features, {len(np.unique(y_test))} classes")
+-    print(f"Class distribution: {dict(Counter(y_test))}")
+-    
+-    # Train a single tree with debug trace enabled (standard bootstrap)
+-    print("\n" + "="*90)
+-    print("TEST 1: Standard uniform bootstrap with debug_trace=True (first 3 nodes traced)")
+-    print("Using n_tries=5 to verify parameter wiring")
+-    print("="*90)
+-    
+-    bworf_debug = ObliqueRandomForestMulti(
+-        n_estimators=1,  # Just one tree for testing
+-        max_depth=3,
+-        min_samples_split=10,
+-        min_samples_leaf=3,
+-        l1_strength=1.0,
+-        random_state=42,
+-        debug_trace=True,
+-        debug_max_nodes=3,
+-        weighted_bootstrap=False,
+-        n_tries=5  # Test n_tries parameter
+-    )
+-    
+-    bworf_debug.fit(X_test, y_test)
+-    
+-    # Make predictions to verify the tree works
+-    y_pred = bworf_debug.predict(X_test)
+-    accuracy = accuracy_score(y_test, y_pred)
+-    
+-    print("\n" + "="*90)
+-    print(f"Test 1 complete! Training accuracy: {accuracy:.3f}")
+-    print("Verify that:")
+-    print("  1. Raw weight sums ≈ n_samples, normalized weight sums ≈ 1.0")
+-    print("  2. Intercept threshold vs CART threshold are shown and may differ")
+-    print("  3. Weighted Gini is computed correctly")
+-    print("  4. n_tries=5 is shown in debug output for split attempts")
+-    print("="*90)
+-    
+-    # Test weighted bootstrap if requested
+-    if test_weighted_bootstrap:
+-        print("\n" + "="*90)
+-        print("TEST 2: Weighted bootstrap with debug_trace=True")
+-        print("="*90)
+-        
+-        bworf_weighted = ObliqueRandomForestMulti(
+-            n_estimators=1,
+-            max_depth=3,
+-            min_samples_split=10,
+-            min_samples_leaf=3,
+-            l1_strength=1.0,
+-            random_state=42,
+-            debug_trace=True,
+-            debug_max_nodes=3,
+-            weighted_bootstrap=True,
+-            bootstrap_weight_mode="balanced",
+-            bootstrap_temperature=1.0
+-        )
+-        
+-        bworf_weighted.fit(X_test, y_test)
+-        
+-        # Make predictions
+-        y_pred_weighted = bworf_weighted.predict(X_test)
+-        accuracy_weighted = accuracy_score(y_test, y_pred_weighted)
+-        
+-        print("\n" + "="*90)
+-        print(f"Test 2 complete! Training accuracy: {accuracy_weighted:.3f}")
+-        print("Verify that:")
+-        print("  1. Bootstrap probability summary was printed")
+-        print("  2. sum(p_i) = 1.0")
+-        print("  3. Minority classes have higher sampling probabilities")
+-        print("="*90)
+-
+-
+-def main():
+-    """
+-    Main function demonstrating Bootstrap and Weighted Oblique Random Forest (BWORF) with Mutual Information filtering and comprehensive 10-fold CV.
+-    """
+-    print("="*90)
+-    print("BOOTSTRAP AND WEIGHTED OBLIQUE RANDOM FOREST (BWORF) WITH MUTUAL INFORMATION FILTERING")
+-    print("="*90)
+-    
+-    # Display filtering configuration
+-    filtering_status = "ENABLED" if use_mi_filter else "DISABLED"
+-    print(f"\nMutual Information Filtering: {filtering_status}")
+-    if use_mi_filter:
+-        print(f"Top K features to select: {top_k}")
+-    
+-    # 1. Generate synthetic dataset with oblique boundaries
+-    print("\n1. DATA GENERATION")
+-    print("-" * 20)
+-    X, y = generate_rotated_dataset()
+-    
+-    # Ensure arrays are numpy arrays
+-    X = np.asarray(X)
+-    y = np.asarray(y)
+-    
+-    print(f"Dataset shape: {X.shape}")
+-    print(f"Number of classes: {len(np.unique(y))}")
+-    print(f"Class distribution: {dict(Counter(y))}")
+-    
+-    # 2. Set up 10-fold stratified cross-validation
+-    print("\n2. COMPREHENSIVE 10-FOLD CROSS-VALIDATION SETUP")
+-    print("-" * 50)
+-    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+-    
+-    # Storage for results across folds - COMPREHENSIVE METRICS
+-    bworf_results = {
+-        'accuracies': [], 'f1_scores': [], 'auroc_scores': [], 
+-        'mcc_scores': [], 'precision_scores': [], 'recall_scores': []
+-    }
+-    rf_results = {
+-        'accuracies': [], 'f1_scores': [], 'auroc_scores': [], 
+-        'mcc_scores': [], 'precision_scores': [], 'recall_scores': []
+-    }
+-    
+-    # Label binarizer for multiclass AUROC
+-    lb = LabelBinarizer()
+-    lb.fit(y)
+-    
+-    fold_num = 1
+-    
+-    # Store data from last fold for detailed visualization
+-    last_fold_data = {}
+-    
+-    print(f"Running comprehensive 10-fold cross-validation...")
+-    print(f"Each fold uses ~{len(X) * 0.9:.0f} training and ~{len(X) * 0.1:.0f} test samples")
+-    print(f"Tracking 6 metrics: Accuracy, F1, AUROC, MCC, Precision, Recall")
+-    
+-    # 3. Run cross-validation with comprehensive metrics
+-    for train_idx, test_idx in skf.split(X, y):
+-        print(f"\n{'='*50}")
+-        print(f"FOLD {fold_num}/10")
+-        print(f"{'='*50}")
+-        
+-        # Split data for this fold
+-        X_train, X_test = X[train_idx], X[test_idx]
+-        y_train, y_test = y[train_idx], y[test_idx]
+-        
+-        print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+-        print(f"Train class distribution: {dict(Counter(y_train))}")
+-        print(f"Test class distribution:  {dict(Counter(y_test))}")
+-        
+-        # Apply Mutual Information filtering for BWORF only if enabled
+-        if use_mi_filter:
+-            print(f"\n--- Applying Mutual Information filtering for BWORF only (Fold {fold_num}) ---")
+-            X_train_bworf, X_test_bworf, selected_features, mi_scores = apply_mutual_information_filtering(
+-                X_train, X_test, y_train, top_k_features=top_k, plot_mi=(fold_num == 1)  # Only plot for first fold
+-            )
+-            print(f"BWORF features after MI filtering: {X_train_bworf.shape[1]}")
+-            print(f"Standard RF uses original features: {X_train.shape[1]}")
+-        else:
+-            print(f"\nSkipping Mutual Information filtering (disabled)")
+-            X_train_bworf, X_test_bworf = X_train, X_test
+-        
+-        # Train Bootstrap and Weighted Oblique Random Forest (with MI filtering if enabled)
+-        print(f"\nTraining BWORF (Fold {fold_num})...")
+-        bworf = ObliqueRandomForestMulti(
+-            n_estimators=10,  # Reduced for faster CV
+-            max_depth=3,
+-            min_samples_split=10,
+-            min_samples_leaf=5,
+-            l1_strength=1.0,
+-            random_state=42 + fold_num  # Different seed per fold
+-        )
+-        bworf.fit(X_train_bworf, y_train)
+-        
+-        # Train Standard Random Forest (always uses original features for fair baseline comparison)
+-        print(f"Training Standard RF (Fold {fold_num})...")
+-        rf = RandomForestClassifier(
+-            n_estimators=10,  # Match BWORF
+-            max_depth=3,
+-            min_samples_split=10,
+-            min_samples_leaf=5,
+-            random_state=42 + fold_num  # Different seed per fold
+-        )
+-        rf.fit(X_train, y_train)  # Uses original unfiltered features
+-        
+-        # Make predictions
+-        print(f"Making predictions and calculating comprehensive metrics (Fold {fold_num})...")
+-        y_pred_bworf = bworf.predict(X_test_bworf)  # BWORF uses filtered features
+-        y_pred_rf = rf.predict(X_test)  # Standard RF uses original features
+-        y_proba_bworf = bworf.predict_proba(X_test_bworf)  # BWORF uses filtered features
+-        y_proba_rf = rf.predict_proba(X_test)  # Standard RF uses original features
+-        
+-        # Ensure probability arrays are numpy arrays
+-        y_proba_bworf = np.asarray(y_proba_bworf)
+-        y_proba_rf = np.asarray(y_proba_rf)
+-        
+-        # Calculate comprehensive metrics for BWORF
+-        acc_bworf = accuracy_score(y_test, y_pred_bworf)
+-        f1_bworf = f1_score(y_test, y_pred_bworf, average='macro')
+-        mcc_bworf = matthews_corrcoef(y_test, y_pred_bworf)
+-        precision_bworf = precision_score(y_test, y_pred_bworf, average='macro')
+-        recall_bworf = recall_score(y_test, y_pred_bworf, average='macro')
+-        
+-        # Calculate AUROC for BWORF
+-        try:
+-            y_test_binarized = lb.transform(y_test)
+-            auroc_bworf = roc_auc_score(y_test_binarized, y_proba_bworf, average='macro', multi_class='ovr')
+-        except Exception:
+-            auroc_bworf = 0.5  # Default if calculation fails
+-        
+-        # Calculate comprehensive metrics for Standard RF
+-        acc_rf = accuracy_score(y_test, y_pred_rf)
+-        f1_rf = f1_score(y_test, y_pred_rf, average='macro')
+-        mcc_rf = matthews_corrcoef(y_test, y_pred_rf)
+-        precision_rf = precision_score(y_test, y_pred_rf, average='macro')
+-        recall_rf = recall_score(y_test, y_pred_rf, average='macro')
+-        
+-        # Calculate AUROC for Standard RF
+-        try:
+-            auroc_rf = roc_auc_score(y_test_binarized, y_proba_rf, average='macro', multi_class='ovr')
+-        except Exception:
+-            auroc_rf = 0.5  # Default if calculation fails
+-        
+-        # Store comprehensive results
+-        bworf_results['accuracies'].append(acc_bworf)
+-        bworf_results['f1_scores'].append(f1_bworf)
+-        bworf_results['auroc_scores'].append(auroc_bworf)
+-        bworf_results['mcc_scores'].append(mcc_bworf)
+-        bworf_results['precision_scores'].append(precision_bworf)
+-        bworf_results['recall_scores'].append(recall_bworf)
+-        
+-        rf_results['accuracies'].append(acc_rf)
+-        rf_results['f1_scores'].append(f1_rf)
+-        rf_results['auroc_scores'].append(auroc_rf)
+-        rf_results['mcc_scores'].append(mcc_rf)
+-        rf_results['precision_scores'].append(precision_rf)
+-        rf_results['recall_scores'].append(recall_rf)
+-        
+-        # Display comprehensive fold results
+-        print(f"\nFOLD {fold_num} COMPREHENSIVE RESULTS:")
+-        print(f"BWORF    - Acc: {acc_bworf:.4f}, F1: {f1_bworf:.4f}, AUROC: {auroc_bworf:.4f}, MCC: {mcc_bworf:.4f}, Prec: {precision_bworf:.4f}, Rec: {recall_bworf:.4f}")
+-        print(f"Std RF   - Acc: {acc_rf:.4f}, F1: {f1_rf:.4f}, AUROC: {auroc_rf:.4f}, MCC: {mcc_rf:.4f}, Prec: {precision_rf:.4f}, Rec: {recall_rf:.4f}")
+-        
+-        # Calculate improvements
+-        acc_imp = ((acc_bworf - acc_rf) / acc_rf * 100) if acc_rf != 0 else 0
+-        f1_imp = ((f1_bworf - f1_rf) / f1_rf * 100) if f1_rf != 0 else 0
+-        auroc_imp = ((auroc_bworf - auroc_rf) / auroc_rf * 100) if auroc_rf != 0 else 0
+-        mcc_imp = ((mcc_bworf - mcc_rf) / mcc_rf * 100) if mcc_rf != 0 else 0
+-        prec_imp = ((precision_bworf - precision_rf) / precision_rf * 100) if precision_rf != 0 else 0
+-        rec_imp = ((recall_bworf - recall_rf) / recall_rf * 100) if recall_rf != 0 else 0
+-        
+-        print(f"Improvement: Acc {acc_imp:+.1f}%, F1 {f1_imp:+.1f}%, AUROC {auroc_imp:+.1f}%, MCC {mcc_imp:+.1f}%, Prec {prec_imp:+.1f}%, Rec {rec_imp:+.1f}%")
+-        
+-        # Store last fold data for detailed visualization
+-        if fold_num == 10:
+-            last_fold_data = {
+-                'y_test': y_test,
+-                'y_pred_bworf': y_pred_bworf,
+-                'y_pred_rf': y_pred_rf,
+-                'y_proba_bworf': y_proba_bworf,
+-                'y_proba_rf': y_proba_rf,
+-                'acc_bworf': acc_bworf,
+-                'acc_rf': acc_rf,
+-                'f1_bworf': f1_bworf,
+-                'f1_rf': f1_rf
+-            }
+-        
+-        fold_num += 1
+-    
+-    # 4. Calculate and display comprehensive overall results
+-    print("\n" + "="*80)
+-    print("COMPREHENSIVE 10-FOLD CROSS-VALIDATION RESULTS")
+-    print("="*80)
+-    
+-    # Convert to numpy arrays for easy calculation
+-    bworf_acc_arr = np.array(bworf_results['accuracies'])
+-    bworf_f1_arr = np.array(bworf_results['f1_scores'])
+-    bworf_auroc_arr = np.array(bworf_results['auroc_scores'])
+-    bworf_mcc_arr = np.array(bworf_results['mcc_scores'])
+-    bworf_precision_arr = np.array(bworf_results['precision_scores'])
+-    bworf_recall_arr = np.array(bworf_results['recall_scores'])
+-    
+-    rf_acc_arr = np.array(rf_results['accuracies'])
+-    rf_f1_arr = np.array(rf_results['f1_scores'])
+-    rf_auroc_arr = np.array(rf_results['auroc_scores'])
+-    rf_mcc_arr = np.array(rf_results['mcc_scores'])
+-    rf_precision_arr = np.array(rf_results['precision_scores'])
+-    rf_recall_arr = np.array(rf_results['recall_scores'])
+-    
+-    # Display comparison description
+-    if use_mi_filter:
+-        comparison_status = "Enhanced BWORF (with MI Filtering) vs Standard RF (Original Features)"
+-    else:
+-        comparison_status = "BWORF vs Standard RF (both using Original Features)"
+-    
+-    print(f"\nComparison: {comparison_status}")
+-    
+-    # Display comprehensive means and standard deviations
+-    print(f"\nBootstrap Weighted Oblique Random Forest{' (with MI Filtering)' if use_mi_filter else ''}:")
+-    print(f"  Accuracy:   {bworf_acc_arr.mean():.4f} ± {bworf_acc_arr.std():.4f}")
+-    print(f"  Macro F1:   {bworf_f1_arr.mean():.4f} ± {bworf_f1_arr.std():.4f}")
+-    print(f"  AUROC:      {bworf_auroc_arr.mean():.4f} ± {bworf_auroc_arr.std():.4f}")
+-    print(f"  MCC:        {bworf_mcc_arr.mean():.4f} ± {bworf_mcc_arr.std():.4f}")
+-    print(f"  Precision:  {bworf_precision_arr.mean():.4f} ± {bworf_precision_arr.std():.4f}")
+-    print(f"  Recall:     {bworf_recall_arr.mean():.4f} ± {bworf_recall_arr.std():.4f}")
+-    
+-    print(f"\nStandard Random Forest (Original Features):")
+-    print(f"  Accuracy:   {rf_acc_arr.mean():.4f} ± {rf_acc_arr.std():.4f}")
+-    print(f"  Macro F1:   {rf_f1_arr.mean():.4f} ± {rf_f1_arr.std():.4f}")
+-    print(f"  AUROC:      {rf_auroc_arr.mean():.4f} ± {rf_auroc_arr.std():.4f}")
+-    print(f"  MCC:        {rf_mcc_arr.mean():.4f} ± {rf_mcc_arr.std():.4f}")
+-    print(f"  Precision:  {rf_precision_arr.mean():.4f} ± {rf_precision_arr.std():.4f}")
+-    print(f"  Recall:     {rf_recall_arr.mean():.4f} ± {rf_recall_arr.std():.4f}")
+-    
+-    # Calculate comprehensive improvements
+-    print(f"\nOverall Improvement (BWORF vs Standard RF):")
+-    for metric_name, bworf_scores, rf_scores in [
+-        ('Accuracy', bworf_acc_arr, rf_acc_arr),
+-        ('Macro F1', bworf_f1_arr, rf_f1_arr),
+-        ('AUROC', bworf_auroc_arr, rf_auroc_arr),
+-        ('MCC', bworf_mcc_arr, rf_mcc_arr),
+-        ('Precision', bworf_precision_arr, rf_precision_arr),
+-        ('Recall', bworf_recall_arr, rf_recall_arr)
+-    ]:
+-        improvement = ((bworf_scores.mean() - rf_scores.mean()) / rf_scores.mean()) * 100
+-        print(f"  {metric_name:<10}: {improvement:+.2f}%")
+-    
+-    # Comprehensive statistical significance tests
+-    print(f"\nStatistical Significance (Paired t-test):")
+-    
+-    for metric_name, bworf_scores, rf_scores in [
+-        ('Accuracy', bworf_acc_arr, rf_acc_arr),
+-        ('Macro F1', bworf_f1_arr, rf_f1_arr),
+-        ('AUROC', bworf_auroc_arr, rf_auroc_arr),
+-        ('MCC', bworf_mcc_arr, rf_mcc_arr),
+-        ('Precision', bworf_precision_arr, rf_precision_arr),
+-        ('Recall', bworf_recall_arr, rf_recall_arr)
+-    ]:
+-        t_stat, p_val = stats.ttest_rel(bworf_scores, rf_scores)
+-        significance = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+-        print(f"  {metric_name:<10}: t={t_stat:.3f}, p={p_val:.4f} {significance}")
+-    
+-    print(f"\nSignificance: *** p<0.001, ** p<0.01, * p<0.05, ns = not significant")
+-    
+-    # 5. Generate comprehensive visualizations
+-    print(f"\n5. COMPREHENSIVE VISUALIZATION")
+-    print("-" * 35)
+-    visualize_comprehensive_cv_results(bworf_results, rf_results)
+-    
+-    # 6. Detailed visualization from the last fold
+-    if last_fold_data:
+-        print(f"\n6. DETAILED VISUALIZATION (Fold 10 Results)")
+-        print("-" * 45)
+-        evaluate_and_visualize(
+-            last_fold_data['y_test'],
+-            last_fold_data['y_pred_bworf'],
+-            last_fold_data['y_pred_rf'],
+-            last_fold_data['y_proba_bworf'],
+-            last_fold_data['y_proba_rf'],
+-            last_fold_data['acc_bworf'],
+-            last_fold_data['acc_rf'],
+-            last_fold_data['f1_bworf'],
+-            last_fold_data['f1_rf']
+-        )
+-    
+-    # 7. Feature Importance Analysis (only if not using MI filtering to avoid confusion)
+-    if not use_mi_filter:
+-        print(f"\n7. FEATURE IMPORTANCE ANALYSIS")
+-        print("-" * 35)
+-        
+-        # Use a single train-test split for feature importance (faster than full CV)
+-        print("Training BWORF on full dataset for feature importance analysis...")
+-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+-        
+-        # Train BWORF model
+-        bworf_final = ObliqueRandomForestMulti(
+-            n_estimators=10,
+-            max_depth=3,
+-            min_samples_split=10,
+-            min_samples_leaf=5,
+-            l1_strength=1.0,
+-            random_state=42
+-        )
+-        bworf_final.fit(X_train, y_train)
+-        
+-        # Calculate and visualize feature importance
+-        print("\nCalculating feature importance (this may take a moment)...")
+-        feature_names = [f'Rotated Feature {i}' for i in range(X.shape[1])]
+-        
+-        # Calculate importance with fewer repeats for speed
+-        importance_scores = bworf_final.visualize_feature_importance(
+-            X_test, y_test, 
+-            feature_names=feature_names, 
+-            n_repeats=5,  # Reduced repeats for speed
+-            save_plot=True
+-        )
+-        
+-        # Display summary
+-        print(f"\nFeature Importance Summary:")
+-        sorted_indices = np.argsort(importance_scores)[::-1]
+-        for i, idx in enumerate(sorted_indices[:5]):  # Top 5 features
+-            print(f"  {i+1}. {feature_names[idx]}: {importance_scores[idx]:.4f}")
+-    else:
+-        print(f"\n7. FEATURE IMPORTANCE ANALYSIS SKIPPED")
+-        print("-" * 40)
+-        print("Feature importance analysis skipped when MI filtering is enabled")
+-        print("to avoid confusion between MI-selected features and permutation importance.")
+-    
+-    print("\n" + "="*90)
+-    print("COMPREHENSIVE 10-FOLD CV BWORF WITH MUTUAL INFORMATION FILTERING COMPLETED")
+-    print("="*90)
+-
+-
+-def test_l1_strength_robustness():
+-    """
+-    Unit test to verify BWORF handles l1_strength=0 and l1_strength>0 correctly.
+-    
+-    Tests:
+-    1. l1_strength=0 doesn't crash (uses large C fallback)
+-    2. l1_strength>0 works normally
+-    3. predict_proba returns shape (n, 2) for binary
+-    4. Probabilities sum to ~1
+-    """
+-    print("=" * 60)
+-    print("TEST: L1 Strength Robustness")
+-    print("=" * 60)
+-    
+-    # Generate simple binary test data
+-    np.random.seed(42)
+-    n_samples, n_features = 100, 10
+-    X = np.random.randn(n_samples, n_features)
+-    y = (X[:, 0] + X[:, 1] > 0).astype(int)  # Simple linear boundary
+-    
+-    test_cases = [
+-        {"l1_strength": 0.0, "expected": "fallback to large C"},
+-        {"l1_strength": -1.0, "expected": "fallback to large C"},
+-        {"l1_strength": None, "expected": "fallback to large C"},
+-        {"l1_strength": 1.0, "expected": "normal operation"},
+-        {"l1_strength": 0.1, "expected": "normal operation"},
+-    ]
+-    
+-    all_passed = True
+-    
+-    for i, tc in enumerate(test_cases):
+-        l1_val = tc["l1_strength"]
+-        print(f"\n[Test {i+1}] l1_strength={l1_val} ({tc['expected']})")
+-        
+-        try:
+-            # Create and fit model
+-            model = ObliqueRandomForestMulti(
+-                n_estimators=5,  # Small for speed
+-                max_depth=3,
+-                min_samples_split=5,
+-                min_samples_leaf=2,
+-                l1_strength=l1_val,
+-                random_state=42
+-            )
+-            model.fit(X, y)
+-            
+-            # Check predict_proba
+-            proba = model.predict_proba(X)
+-            
+-            # Validate shape
+-            if proba.shape != (n_samples, 2):
+-                print(f"  FAIL: predict_proba shape {proba.shape}, expected ({n_samples}, 2)")
+-                all_passed = False
+-                continue
+-            
+-            # Validate probabilities sum to 1
+-            row_sums = proba.sum(axis=1)
+-            if not np.allclose(row_sums, 1.0, atol=1e-6):
+-                print(f"  FAIL: Row sums not ~1.0, range [{row_sums.min():.4f}, {row_sums.max():.4f}]")
+-                all_passed = False
+-                continue
+-            
+-            # Validate values in [0, 1]
+-            if not (np.all(proba >= 0) and np.all(proba <= 1)):
+-                print(f"  FAIL: Probabilities outside [0,1]")
+-                all_passed = False
+-                continue
+-            
+-            print(f"  PASS: shape={proba.shape}, row_sums in [{row_sums.min():.4f}, {row_sums.max():.4f}]")
+-            
+-        except Exception as e:
+-            print(f"  FAIL: Exception raised: {e}")
+-            all_passed = False
+-    
+-    print("\n" + "=" * 60)
+-    if all_passed:
+-        print("ALL TESTS PASSED")
+-    else:
+-        print("SOME TESTS FAILED")
+-    print("=" * 60)
+-    
+-    return all_passed
+-
+-
+-# ==============================================================================
+-# BWORFClassifier - Wrapper for v3 simulation study
+-# ==============================================================================
+-
+-
+-class BWORFClassifier(ObliqueRandomForestMulti):
+-    """
+-    BWORF (Bootstrap Weighted Oblique Random Forest) Classifier.
+-    
+-    This is the BWORF model used in the v3 simulation study. It is a thin wrapper
+-    around ObliqueRandomForestMulti to provide a consistent import interface:
+-    
+-        from models.bworf_with_mi import BWORFClassifier
+-    
+-    Inherits all functionality from ObliqueRandomForestMulti including:
+-    - L1-regularized oblique splits
+-    - Bootstrap sampling (optionally weighted)
+-    - Multiclass classification support
+-    - fit(X, y), predict(X), predict_proba(X) methods
+-    """
+-    
+-    def __init__(
+-        self,
+-        n_estimators=100,
+-        max_depth=5,
+-        min_samples_split=10,
+-        min_samples_leaf=5,
+-        l1_strength=1.0,
+-        random_state=None,
+-        debug_trace=False,
+-        debug_max_nodes=3,
+-        weighted_bootstrap=False,
+-        bootstrap_weight_mode="balanced",
+-        bootstrap_temperature=1.0,
+-        n_tries=2,
+-    ):
+-        """
+-        Initialize BWORFClassifier.
+-        
+-        Parameters match ObliqueRandomForestMulti exactly. See parent class for details.
+-        """
+-        super().__init__(
+-            n_estimators=n_estimators,
+-            max_depth=max_depth,
+-            min_samples_split=min_samples_split,
+-            min_samples_leaf=min_samples_leaf,
+-            l1_strength=l1_strength,
+-            random_state=random_state,
+-            debug_trace=debug_trace,
+-            debug_max_nodes=debug_max_nodes,
+-            weighted_bootstrap=weighted_bootstrap,
+-            bootstrap_weight_mode=bootstrap_weight_mode,
+-            bootstrap_temperature=bootstrap_temperature,
+-            n_tries=n_tries,
+-        )
+-
+-
+-# ==============================================================================
+-# Public API
+-# ==============================================================================
+-
+-__all__ = [
+-    "BWORFClassifier",
+-    "ObliqueRandomForestMulti",
+-    "ObliqueDecisionTreeMulti",
+-]
+-
+-
+-if __name__ == "__main__":
+-    import sys
+-    
+-    # Simple CLI: 
+-    #   python bworf_with_mi.py test_debug            - test standard bootstrap
+-    #   python bworf_with_mi.py test_debug weighted   - test weighted bootstrap
+-    #   python bworf_with_mi.py test_l1               - test l1_strength robustness
+-    if len(sys.argv) > 1 and sys.argv[1] == "test_debug":
+-        test_weighted = (len(sys.argv) > 2 and sys.argv[2] == "weighted")
+-        test_debug_trace(test_weighted_bootstrap=test_weighted)
+-    elif len(sys.argv) > 1 and sys.argv[1] == "test_l1":
+-        test_l1_strength_robustness()
+-    else:
+-        main() 
+\ No newline at end of file
++import numpy as np
++import matplotlib.pyplot as plt
++from sklearn.datasets import make_classification
++from sklearn.model_selection import train_test_split, StratifiedKFold
++from sklearn.ensemble import RandomForestClassifier
++from sklearn.linear_model import LogisticRegression
++from sklearn.utils.class_weight import compute_sample_weight
++from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix, ConfusionMatrixDisplay, 
++                           roc_curve, auc, roc_auc_score, matthews_corrcoef, precision_score, recall_score)
++from sklearn.preprocessing import LabelBinarizer
++from sklearn.feature_selection import mutual_info_classif
++from collections import Counter
++from scipy import stats
++import warnings
++warnings.filterwarnings('ignore')
++
++# Toggle variable to control whether MI filtering is applied
++use_mi_filter = True
++
++# Keep the top K features (defined at the top)
++top_k = 100
++
++def generate_rotated_dataset():
++    """
++    Generate synthetic dataset with oblique decision boundaries for DILI classification.
++    
++    Returns:
++        X_rotated: Rotated feature matrix (1200 x 10)
++        y: Target labels (6 classes representing DILI risk categories)
++    """
++    print("Generating base synthetic dataset...")
++    
++    # Generate base dataset with specified parameters
++    X, y = make_classification(
++        n_samples=1200, 
++        n_features=10, 
++        n_classes=6,
++        n_informative=8,  # Need enough informative features for 6 classes
++        n_redundant=1,
++        n_clusters_per_class=1,
++        class_sep=1.5,
++        flip_y=0.01,
++        random_state=42
++    )
++    
++    print("Applying random rotation using QR decomposition...")
++    
++    # Apply random rotation using QR decomposition to introduce oblique boundaries
++    np.random.seed(42)
++    random_matrix = np.random.randn(10, 10)
++    Q, R = np.linalg.qr(random_matrix)
++    X_rotated = X @ Q
++    
++    return X_rotated, y
++
++
++class ObliqueDecisionTreeMulti:
++    """
++    Bootstrap and Weighted Oblique Decision Tree for multiclass classification.
++    
++    Uses L1-regularized logistic regression for learned oblique splits with balanced class weights.
++    """
++    
++    def __init__(self, max_depth=5, min_samples_split=10, min_samples_leaf=5, l1_strength=1.0, 
++                 random_state=None, debug_trace=False, debug_max_nodes=3, n_tries=10):
++        """
++        Initialize oblique decision tree with L1-regularized splits.
++        
++        Args:
++            max_depth: Maximum tree depth
++            min_samples_split: Minimum samples required to split
++            min_samples_leaf: Minimum samples in leaf nodes
++            l1_strength: L1 regularization strength (higher = more sparse)
++            random_state: Random seed for reproducibility
++            debug_trace: Enable debug trace mode for verification
++            debug_max_nodes: Maximum number of nodes to trace in debug mode
++            n_tries: Number of random binary split attempts per node (default=10)
++        """
++        self.max_depth = max_depth
++        self.min_samples_split = min_samples_split
++        self.min_samples_leaf = min_samples_leaf
++        self.l1_strength = l1_strength
++        self.random_state = random_state
++        self.debug_trace = debug_trace
++        self.debug_max_nodes = debug_max_nodes
++        self.n_tries = n_tries
++        self.tree = None
++        self.n_classes_ = None  # Will be set during fit
++        self._debug_node_counter = 0  # Counter for debug trace
++        self._l1_warning_issued = False  # Track if we've warned about invalid l1_strength
++        
++    def compute_node_weights(self, y, class_weight_mode="balanced", normalize=True):
++        """
++        Compute explicit per-sample weights ω_i^(t) for a node.
++        
++        Args:
++            y: Target labels for samples in this node
++            class_weight_mode: "balanced" for inverse frequency weighting
++            normalize: If True, normalize weights to sum=1 (for Gini); 
++                      If False, return raw weights (for LogisticRegression)
++            
++        Returns:
++            weights: Raw or normalized sample weights
++        """
++        n_samples = len(y)
++        if n_samples == 0:
++            return np.array([])
++        
++        unique_classes, class_counts = np.unique(y, return_counts=True)
++        n_classes = len(unique_classes)
++        
++        # Compute class weights: w_class[k] = n_samples / (n_classes * count_k)
++        class_weights_dict = {}
++        for cls, count in zip(unique_classes, class_counts):
++            if class_weight_mode == "balanced":
++                class_weights_dict[cls] = n_samples / (n_classes * count)
++            else:
++                class_weights_dict[cls] = 1.0  # Uniform weights
++        
++        # Assign weights to samples based on their class
++        weights = np.array([class_weights_dict[label] for label in y])
++        
++        # Normalize to sum to 1.0 if requested
++        if normalize:
++            weights = weights / weights.sum()
++            
++            # Verification in debug mode
++            if self.debug_trace and abs(weights.sum() - 1.0) > 1e-8:
++                raise ValueError(f"Weights do not sum to 1.0: {weights.sum()}")
++        
++        return weights
++
++    def _weighted_class_totals(self, y, weights=None, n_classes=None):
++        """
++        Compute per-class totals using either raw counts or explicit sample weights.
++
++        Args:
++            y: Target labels
++            weights: Optional sample weights aligned to ``y``
++            n_classes: Optional total number of classes
++
++        Returns:
++            totals: Array of length ``n_classes`` with class totals
++        """
++        if n_classes is None:
++            n_classes = self.n_classes_ if self.n_classes_ is not None else len(np.unique(y))
++
++        if len(y) == 0:
++            return np.zeros(n_classes, dtype=float)
++
++        if weights is None:
++            return np.bincount(y, minlength=n_classes).astype(float)
++
++        weights = np.asarray(weights, dtype=float)
++        totals = np.zeros(n_classes, dtype=float)
++        for cls in range(n_classes):
++            mask = (y == cls)
++            if np.any(mask):
++                totals[cls] = weights[mask].sum()
++        return totals
++    
++    def _gini_impurity(self, y, weights=None):
++        """
++        Calculate Gini impurity for multiclass classification.
++        
++        Args:
++            y: Target labels
++            weights: Optional sample weights (if None, uniform weights)
++            
++        Returns:
++            Gini impurity score
++        """
++        if len(y) == 0:
++            return 0
++        
++        n_classes = self.n_classes_ if self.n_classes_ is not None else len(np.unique(y))
++
++        class_totals = self._weighted_class_totals(y, weights=weights, n_classes=n_classes)
++        total_mass = class_totals.sum()
++        if total_mass <= 0:
++            return 0.0
++
++        probabilities = class_totals / total_mass
++
++        # Gini = 1 - sum(p_i^2)
++        return 1 - np.sum(probabilities ** 2)
++    
++    def _find_best_split_logistic(self, X, y, rng, node_weights_raw=None, node_weights_norm=None):
++        """
++        Find best oblique split using L1-regularized logistic regression with CART-style threshold optimization.
++        
++        Args:
++            X: Feature matrix for this node
++            y: Target labels for this node
++            rng: Random number generator
++            node_weights_raw: Raw per-sample weights (for LogisticRegression, sum ≈ n_samples)
++            node_weights_norm: Normalized per-sample weights (for Gini, sum=1)
++            
++        Returns:
++            best_w: Best projection vector from logistic regression
++            best_threshold: Best threshold value (from CART scan)
++            best_gini: Best weighted Gini impurity after split
++        """
++        n_samples, n_features = X.shape
++        
++        # Check if split is possible
++        if len(np.unique(y)) <= 1:
++            return None, None, None
++            
++        # Check minimum samples constraints
++        if n_samples < self.min_samples_split:
++            return None, None, None
++        
++        # Compute explicit node weights if not provided
++        if node_weights_raw is None:
++            node_weights_raw = self.compute_node_weights(y, class_weight_mode="balanced", normalize=False)
++        if node_weights_norm is None:
++            node_weights_norm = self.compute_node_weights(y, class_weight_mode="balanced", normalize=True)
++        
++        best_w, best_threshold, best_gini = None, None, float('inf')
++        current_gini = self._gini_impurity(y, weights=node_weights_norm)
++        
++        # Debug trace for this node
++        should_debug = (self.debug_trace and self._debug_node_counter < self.debug_max_nodes)
++        
++        if should_debug:
++            print(f"      [DEBUG] Using n_tries={self.n_tries} for this node")
++        
++        # Try multiple random binary groupings for oblique splits
++        for attempt in range(self.n_tries):
++            try:
++                # Create random binary split of the classes for this attempt
++                unique_classes = np.unique(y)
++                if len(unique_classes) == 2:
++                    # Already binary, use as-is
++                    binary_y = y.copy()
++                else:
++                    # Randomly split classes into two groups
++                    rng.shuffle(unique_classes)
++                    mid_point = len(unique_classes) // 2
++                    if mid_point == 0:
++                        mid_point = 1
++                    
++                    group_0_classes = unique_classes[:mid_point]
++                    group_1_classes = unique_classes[mid_point:]
++                    
++                    # Convert multiclass to binary
++                    binary_y = np.zeros(len(y), dtype=int)
++                    for cls in group_1_classes:
++                        binary_y[y == cls] = 1
++                
++                # Skip if the binary split is too imbalanced
++                if np.sum(binary_y == 0) < self.min_samples_leaf or np.sum(binary_y == 1) < self.min_samples_leaf:
++                    continue
++                
++                # Use RAW weights for LogisticRegression (not normalized)
++                # This prevents the sum=1 normalization from affecting effective regularization
++                sample_weights_for_lr = node_weights_raw.copy()
++                
++                # Define L1-regularized logistic regression for binary classification
++                # Guard against l1_strength <= 0 to prevent division by zero
++                if self.l1_strength is None or self.l1_strength <= 0:
++                    # Use large C (approximates no regularization) when l1_strength is invalid
++                    C = 1e6
++                    if not self._l1_warning_issued:
++                        print(f"  [WARNING] Invalid l1_strength={self.l1_strength} supplied; "
++                              f"using large C={C:.0e} approximation (no regularization).")
++                        self._l1_warning_issued = True
++                else:
++                    C = 1.0 / self.l1_strength  # Convert strength to sklearn's C parameter
++                
++                clf = LogisticRegression(
++                    penalty='l1',
++                    solver='liblinear',  # Better for L1 with binary classification
++                    max_iter=1000,
++                    C=C,
++                    random_state=None if self.random_state is None else self.random_state + attempt,
++                    fit_intercept=True
++                )
++                
++                # Fit the binary classifier with explicit sample weights
++                clf.fit(X, binary_y, sample_weight=sample_weights_for_lr)
++                
++                # Extract projection vector w
++                if hasattr(clf, 'coef_') and clf.coef_ is not None:
++                    w = clf.coef_.flatten()
++                    
++                    # Check if w is all zeros (fallback case)
++                    if np.all(np.abs(w) < 1e-10):
++                        if should_debug:
++                            print(f"      [DEBUG] Attempt {attempt+1}: All-zero coefficients, skipping")
++                        continue
++                    
++                    # Compute projection z = X @ w
++                    z = X @ w
++                    
++                    # Check if z has sufficient unique values for threshold optimization
++                    unique_z = np.unique(z)
++                    if len(unique_z) < 2:
++                        if should_debug:
++                            print(f"      [DEBUG] Attempt {attempt+1}: Insufficient unique z values ({len(unique_z)}), skipping")
++                        continue
++                    
++                    # CART-style threshold optimization along projection z
++                    # Sort z, y, and weights by z
++                    sorted_indices = np.argsort(z)
++                    z_sorted = z[sorted_indices]
++                    y_sorted = y[sorted_indices]
++                    w_sorted = node_weights_norm[sorted_indices]
++                    
++                    # Candidate thresholds: midpoints between consecutive unique z values
++                    candidate_thresholds = []
++                    for i in range(len(unique_z) - 1):
++                        threshold_candidate = (unique_z[i] + unique_z[i+1]) / 2.0
++                        candidate_thresholds.append(threshold_candidate)
++                    
++                    # Evaluate each candidate threshold
++                    best_c_for_this_w = None
++                    best_gini_for_this_w = float('inf')
++                    
++                    # Also compute intercept-based threshold for comparison
++                    if hasattr(clf, 'intercept_') and clf.intercept_ is not None:
++                        if isinstance(clf.intercept_, np.ndarray):
++                            intercept_threshold = -clf.intercept_[0]
++                        else:
++                            intercept_threshold = -clf.intercept_
++                    else:
++                        intercept_threshold = 0.0
++                    
++                    for c_candidate in candidate_thresholds:
++                        left_mask = z <= c_candidate
++                        right_mask = ~left_mask
++                        
++                        # Check minimum samples constraint
++                        if (np.sum(left_mask) < self.min_samples_leaf or 
++                            np.sum(right_mask) < self.min_samples_leaf):
++                            continue
++                        
++                        # Calculate weighted Gini impurity on original multiclass labels
++                        # Use NORMALIZED weights for Gini computation
++                        y_left = y[left_mask]
++                        y_right = y[right_mask]
++                        w_left = node_weights_norm[left_mask]
++                        w_right = node_weights_norm[right_mask]
++                        
++                        # Normalize weights for each side
++                        W_left = w_left.sum()
++                        W_right = w_right.sum()
++                        
++                        if W_left > 0:
++                            w_left_norm = w_left / W_left
++                        else:
++                            w_left_norm = w_left
++                        
++                        if W_right > 0:
++                            w_right_norm = w_right / W_right
++                        else:
++                            w_right_norm = w_right
++                        
++                        left_gini = self._gini_impurity(y_left, weights=w_left_norm)
++                        right_gini = self._gini_impurity(y_right, weights=w_right_norm)
++                        
++                        # Total weighted Gini
++                        weighted_gini = W_left * left_gini + W_right * right_gini
++                        
++                        if weighted_gini < best_gini_for_this_w:
++                            best_c_for_this_w = c_candidate
++                            best_gini_for_this_w = weighted_gini
++                    
++                    # If no valid threshold found via CART scan, skip this attempt
++                    if best_c_for_this_w is None:
++                        if should_debug:
++                            print(f"      [DEBUG] Attempt {attempt+1}: No valid CART threshold found, skipping")
++                        continue
++                    
++                    # Keep the best split found so far across all attempts
++                    if best_gini_for_this_w < best_gini and best_gini_for_this_w < current_gini:
++                        best_w = w.copy()
++                        best_threshold = best_c_for_this_w
++                        best_gini = best_gini_for_this_w
++                        
++                        # Debug: print info
++                        non_zero_features = np.sum(np.abs(w) > 1e-10)
++                        if should_debug:
++                            print(f"      [DEBUG] Attempt {attempt+1}: {non_zero_features}/{n_features} non-zero features")
++                            print(f"      [DEBUG]   Intercept threshold: {intercept_threshold:.4f}, CART threshold: {best_c_for_this_w:.4f}")
++                            print(f"      [DEBUG]   Weighted Gini: {best_gini_for_this_w:.4f} (before: {current_gini:.4f})")
++                        else:
++                            print(f"    Node split attempt {attempt+1}: {non_zero_features}/{n_features} non-zero features, Gini: {best_gini_for_this_w:.4f}")
++                        
++            except Exception as e:
++                print(f"    Warning: Logistic regression attempt {attempt+1} failed: {e}")
++                continue
++        
++        return best_w, best_threshold, best_gini
++    
++    def _build_tree(self, X, y, depth, rng):
++        """
++        Recursively build the oblique decision tree using L1-regularized splits with explicit node weights.
++        
++        Args:
++            X: Feature matrix
++            y: Target labels
++            depth: Current depth
++            rng: Random number generator
++            
++        Returns:
++            Node dictionary representing the tree structure
++        """
++        # Compute explicit node weights ω_i^(t) - both raw and normalized
++        node_weights_raw = self.compute_node_weights(y, class_weight_mode="balanced", normalize=False)
++        node_weights_norm = self.compute_node_weights(y, class_weight_mode="balanced", normalize=True)
++        
++        # Create node with basic statistics
++        n_classes = self.n_classes_ if self.n_classes_ is not None else len(np.unique(y))
++        class_counts = self._weighted_class_totals(y, weights=None, n_classes=n_classes)
++        class_counts_int = class_counts.astype(int)
++        class_weight_sums = self._weighted_class_totals(y, weights=node_weights_raw, n_classes=n_classes)
++        class_weight_probs = self._weighted_class_totals(y, weights=node_weights_norm, n_classes=n_classes)
++
++        weighted_candidates = np.flatnonzero(np.isclose(class_weight_probs, class_weight_probs.max()))
++        if len(weighted_candidates) == 1:
++            predicted_class = int(weighted_candidates[0])
++        else:
++            predicted_class = int(weighted_candidates[np.argmax(class_counts_int[weighted_candidates])])
++
++        node = {
++            'samples': len(y),
++            'gini': self._gini_impurity(y, weights=node_weights_norm),
++            'class_counts': class_counts_int,
++            'class_weight_sums': class_weight_sums,
++            'class_probabilities': class_weight_probs,
++            'predicted_class': predicted_class
++        }
++        
++        # Debug trace for this node
++        should_debug = (self.debug_trace and self._debug_node_counter < self.debug_max_nodes)
++        
++        if should_debug:
++            print(f"\n    [DEBUG NODE {self._debug_node_counter}] Depth: {depth}, Samples: {len(y)}")
++            print(f"    [DEBUG] Normalized weight summary: sum={node_weights_norm.sum():.6f}, min={node_weights_norm.min():.6f}, max={node_weights_norm.max():.6f}, mean={node_weights_norm.mean():.6f}")
++            print(f"    [DEBUG] Raw weight summary: sum={node_weights_raw.sum():.2f}, min={node_weights_raw.min():.6f}, max={node_weights_raw.max():.6f}")
++            for cls in range(n_classes):
++                mask = (y == cls)
++                if mask.any():
++                    print(f"    [DEBUG]   sum(ω_norm[y=={cls}]) = {node_weights_norm[mask].sum():.6f}, sum(ω_raw[y=={cls}]) = {node_weights_raw[mask].sum():.2f}")
++            print(f"    [DEBUG] Weighted class probabilities: {np.round(node['class_probabilities'], 4)}")
++            print(f"    [DEBUG] Weighted predicted class: {node['predicted_class']}")
++            print(f"    [DEBUG] Gini (weighted): {node['gini']:.4f}")
++            self._debug_node_counter += 1
++        else:
++            print(f"    Building node at depth {depth}, samples: {len(y)}, gini: {node['gini']:.4f}")
++        
++        # Check stopping criteria
++        # Note: max_depth=None means unlimited depth, so only check if it's set
++        if ((self.max_depth is not None and depth >= self.max_depth) or 
++            len(y) < self.min_samples_split or 
++            len(np.unique(y)) <= 1 or
++            node['gini'] < 1e-10):
++            node['is_leaf'] = True
++            print(f"    -> Leaf node (depth={depth}, samples={len(y)})")
++            return node
++        
++        # Find best oblique split using logistic regression with CART-style threshold optimization
++        w, threshold, gini = self._find_best_split_logistic(X, y, rng, node_weights_raw=node_weights_raw, node_weights_norm=node_weights_norm)
++        
++        if w is None:  # No valid split found
++            node['is_leaf'] = True
++            print(f"    -> Leaf node (no valid split found)")
++            return node
++        
++        # Apply split and create child nodes
++        z = X @ w
++        left_mask = z <= threshold  # Use <= for consistency
++        right_mask = ~left_mask
++        
++        # Ensure both children have minimum samples
++        if (np.sum(left_mask) < self.min_samples_leaf or 
++            np.sum(right_mask) < self.min_samples_leaf):
++            node['is_leaf'] = True
++            print(f"    -> Leaf node (insufficient samples in children)")
++            return node
++        
++        # Store split information and recursively build children
++        node['is_leaf'] = False
++        node['projection'] = w
++        node['threshold'] = threshold
++        
++        if should_debug:
++            print(f"    [DEBUG] Split chosen: threshold={threshold:.4f}, gini_after={gini:.4f}")
++            gini_improvement = node['gini'] - gini
++            print(f"    [DEBUG] Gini improvement: {gini_improvement:.4f}")
++        
++        print(f"    -> Split node: {np.sum(left_mask)} left, {np.sum(right_mask)} right")
++        
++        node['left'] = self._build_tree(X[left_mask], y[left_mask], depth + 1, rng)
++        node['right'] = self._build_tree(X[right_mask], y[right_mask], depth + 1, rng)
++        
++        return node
++    
++    def fit(self, X, y):
++        """
++        Train the oblique decision tree using L1-regularized logistic regression splits.
++        
++        Args:
++            X: Training feature matrix
++            y: Training target labels
++            
++        Returns:
++            self
++        """
++        print(f"  Training oblique tree with L1 strength: {self.l1_strength}")
++        
++        # Set number of classes dynamically
++        self.n_classes_ = len(np.unique(y))
++        print(f"  Detected {self.n_classes_} classes")
++        
++        # Reset debug node counter
++        self._debug_node_counter = 0
++        
++        rng = np.random.RandomState(self.random_state)
++        self.tree = self._build_tree(X, y, 0, rng)
++        return self
++    
++    def _predict_sample(self, x, node):
++        """
++        Predict class for a single sample by traversing the tree.
++        
++        Args:
++            x: Single sample feature vector
++            node: Current tree node
++            
++        Returns:
++            Predicted class label
++        """
++        if node['is_leaf']:
++            return node['predicted_class']
++        
++        # Apply learned oblique projection and threshold: w^T x <= c (consistent with training)
++        z = x @ node['projection']
++        
++        if z <= node['threshold']:
++            return self._predict_sample(x, node['left'])
++        else:
++            return self._predict_sample(x, node['right'])
++    
++    def predict(self, X):
++        """
++        Predict classes for multiple samples.
++        
++        Args:
++            X: Feature matrix for prediction
++            
++        Returns:
++            Array of predicted class labels
++        """
++        if self.tree is None:
++            raise ValueError("Tree not fitted. Call fit() first.")
++        
++        return np.array([self._predict_sample(x, self.tree) for x in X])
++    
++    def _predict_proba_sample(self, x, node):
++        """
++        Predict class probabilities for a single sample by traversing the tree.
++        
++        Args:
++            x: Single sample feature vector
++            node: Current tree node
++            
++        Returns:
++            Array of class probabilities
++        """
++        if node['is_leaf']:
++            # Return normalized class probabilities from leaf node. Prefer the
++            # explicit weighted probabilities so terminal predictions remain
++            # consistent with weighted training.
++            n_classes = self.n_classes_ if self.n_classes_ is not None else len(node['class_counts'])
++            if 'class_probabilities' in node:
++                probs = np.asarray(node['class_probabilities'], dtype=float)
++                if probs.sum() > 0:
++                    return probs / probs.sum()
++
++            total_samples = np.sum(node['class_counts'])
++            if total_samples == 0:
++                return np.ones(n_classes) / n_classes  # Uniform distribution if no samples
++            return node['class_counts'] / total_samples
++        
++        # Apply learned oblique projection and threshold: w^T x <= c (consistent with training)
++        z = x @ node['projection']
++        
++        if z <= node['threshold']:
++            return self._predict_proba_sample(x, node['left'])
++        else:
++            return self._predict_proba_sample(x, node['right'])
++    
++    def predict_proba(self, X):
++        """
++        Predict class probabilities for multiple samples.
++        
++        Args:
++            X: Feature matrix for prediction
++            
++        Returns:
++            Array of shape (n_samples, n_classes) with class probabilities
++        """
++        if self.tree is None:
++            raise ValueError("Tree not fitted. Call fit() first.")
++        
++        return np.array([self._predict_proba_sample(x, self.tree) for x in X])
++
++
++class ObliqueRandomForestMulti:
++    """
++    Bootstrap and Weighted Oblique Random Forest for multiclass classification.
++    
++    Ensemble of oblique decision trees using bootstrap sampling, L1-regularized splits, and majority voting.
++    """
++    
++    def __init__(self, n_estimators=100, max_depth=5, min_samples_split=10, 
++                 min_samples_leaf=5, l1_strength=1.0, random_state=None,
++                 debug_trace=False, debug_max_nodes=3,
++                 weighted_bootstrap=True, bootstrap_weight_mode="balanced", 
++                 bootstrap_temperature=1.0, n_tries=10):
++        """
++        Initialize bootstrap and weighted oblique random forest.
++        
++        Args:
++            n_estimators: Number of trees in the forest
++            max_depth: Maximum depth of each tree
++            min_samples_split: Minimum samples required to split
++            min_samples_leaf: Minimum samples in leaf nodes
++            l1_strength: L1 regularization strength for oblique splits
++            random_state: Random seed for reproducibility
++            debug_trace: Enable debug trace mode (only for first tree)
++            debug_max_nodes: Maximum number of nodes to trace in debug mode
++            weighted_bootstrap: If True, use non-uniform bootstrap sampling based on class weights
++            bootstrap_weight_mode: Mode for computing bootstrap weights ("balanced" for now)
++            bootstrap_temperature: Temperature for sharpening/flattening bootstrap probabilities
++            n_tries: Number of random binary split attempts per node (default=10)
++        """
++        self.n_estimators = n_estimators
++        self.max_depth = max_depth
++        self.min_samples_split = min_samples_split
++        self.min_samples_leaf = min_samples_leaf
++        self.l1_strength = l1_strength
++        self.random_state = random_state
++        self.debug_trace = debug_trace
++        self.debug_max_nodes = debug_max_nodes
++        self.weighted_bootstrap = weighted_bootstrap
++        self.bootstrap_weight_mode = bootstrap_weight_mode
++        self.bootstrap_temperature = bootstrap_temperature
++        self.n_tries = n_tries
++        self.trees = []
++    
++    def fit(self, X, y):
++        """
++        Train the bootstrap and weighted oblique random forest.
++        
++        Args:
++            X: Training feature matrix
++            y: Training target labels
++            
++        Returns:
++            self
++        """
++        rng = np.random.RandomState(self.random_state)
++        self.trees = []
++        
++        n_samples = len(X)
++        
++        print(f"Training {self.n_estimators} oblique trees with L1 regularization...")
++        print(f"  weighted_bootstrap={self.weighted_bootstrap}, bootstrap_weight_mode={self.bootstrap_weight_mode}, bootstrap_temperature={self.bootstrap_temperature}")
++        print(f"  n_tries={self.n_tries}")
++        
++        # Compute bootstrap sampling probabilities if weighted_bootstrap is enabled
++        bootstrap_probs = None
++        if self.weighted_bootstrap:
++            if self.bootstrap_weight_mode == "balanced":
++                # Compute per-sample class-balanced weights
++                unique_classes, class_counts = np.unique(y, return_counts=True)
++                n_classes = len(unique_classes)
++                
++                # Create class weight dictionary
++                class_weights_dict = {}
++                for cls, count in zip(unique_classes, class_counts):
++                    class_weights_dict[cls] = n_samples / (n_classes * count)
++                
++                # Assign weights to each sample
++                sample_weights = np.array([class_weights_dict[label] for label in y])
++                
++                # Apply temperature and normalize to probabilities
++                sample_weights_temp = sample_weights ** self.bootstrap_temperature
++                bootstrap_probs = sample_weights_temp / sample_weights_temp.sum()
++                
++                # Debug trace for weighted bootstrap
++                if self.debug_trace:
++                    print(f"\n[DEBUG WEIGHTED BOOTSTRAP]")
++                    print(f"  Mode: {self.bootstrap_weight_mode}, Temperature: {self.bootstrap_temperature}")
++                    print(f"  Class counts: {dict(zip(unique_classes, class_counts))}")
++                    print(f"  Bootstrap probabilities: sum={bootstrap_probs.sum():.6f}, min={bootstrap_probs.min():.6f}, max={bootstrap_probs.max():.6f}, mean={bootstrap_probs.mean():.6f}")
++                    for cls in unique_classes:
++                        mask = (y == cls)
++                        print(f"    Class {cls}: mean_prob={bootstrap_probs[mask].mean():.6f}, sum_prob={bootstrap_probs[mask].sum():.6f}")
++        
++        for i in range(self.n_estimators):
++            print(f"\nTraining tree {i+1}/{self.n_estimators}")
++            
++            # Bootstrap sampling with replacement
++            if self.weighted_bootstrap and bootstrap_probs is not None:
++                # Non-uniform weighted bootstrap
++                bootstrap_indices = rng.choice(n_samples, size=n_samples, replace=True, p=bootstrap_probs)
++            else:
++                # Standard uniform bootstrap
++                bootstrap_indices = rng.choice(n_samples, size=n_samples, replace=True)
++            
++            X_bootstrap = X[bootstrap_indices]
++            y_bootstrap = y[bootstrap_indices]
++            
++            # Enable debug trace only for the first tree
++            enable_debug = (i == 0) and self.debug_trace
++            
++            # Train individual oblique tree with L1-regularized splits
++            tree = ObliqueDecisionTreeMulti(
++                max_depth=self.max_depth,
++                min_samples_split=self.min_samples_split,
++                min_samples_leaf=self.min_samples_leaf,
++                l1_strength=self.l1_strength,
++                random_state=rng.randint(0, 100000),
++                debug_trace=enable_debug,
++                debug_max_nodes=self.debug_max_nodes,
++                n_tries=self.n_tries
++            )
++            
++            tree.fit(X_bootstrap, y_bootstrap)
++            self.trees.append(tree)
++            
++            # Progress indicator
++            if (i + 1) % 5 == 0:
++                print(f"  Completed {i + 1}/{self.n_estimators} trees")
++        
++        return self
++    
++    def predict(self, X):
++        """
++        Predict using majority vote from all trees.
++        
++        Args:
++            X: Feature matrix for prediction
++            
++        Returns:
++            Array of predicted class labels
++        """
++        if not self.trees:
++            raise ValueError("Forest not fitted. Call fit() first.")
++        
++        # Get predictions from all trees
++        all_predictions = np.array([tree.predict(X) for tree in self.trees])
++        
++        # Majority vote for each sample
++        predictions = []
++        for i in range(X.shape[0]):
++            tree_votes = all_predictions[:, i]
++            vote_counts = Counter(tree_votes)
++            # Get the most common prediction
++            majority_class = vote_counts.most_common(1)[0][0]
++            predictions.append(majority_class)
++        
++        return np.array(predictions)
++    
++    def predict_proba(self, X):
++        """
++        Predict class probabilities using average of all trees.
++        
++        Args:
++            X: Feature matrix for prediction
++            
++        Returns:
++            Array of shape (n_samples, n_classes) with class probabilities
++        """
++        if not self.trees:
++            raise ValueError("Forest not fitted. Call fit() first.")
++        
++        # Get probability predictions from all trees and average them
++        all_probas = np.array([tree.predict_proba(X) for tree in self.trees])
++        return np.mean(all_probas, axis=0)
++    
++    def get_feature_importance(self, X, y, n_repeats=10):
++        """
++        Calculate feature importance using permutation importance.
++        
++        Args:
++            X: Feature matrix
++            y: Target labels
++            n_repeats: Number of permutation repeats for averaging
++            
++        Returns:
++            feature_importance: Array of importance scores for each feature
++        """
++        if not self.trees:
++            raise ValueError("Forest not fitted. Call fit() first.")
++        
++        print("Calculating feature importance using permutation method...")
++        
++        # Get baseline accuracy
++        baseline_acc = accuracy_score(y, self.predict(X))
++        
++        n_features = X.shape[1]
++        importances = np.zeros(n_features)
++        
++        # Calculate permutation importance for each feature
++        for feature_idx in range(n_features):
++            feature_scores = []
++            
++            for repeat in range(n_repeats):
++                # Create a copy of X and permute the feature
++                X_permuted = X.copy()
++                
++                # Set random seed for reproducible permutation
++                rng = np.random.RandomState(self.random_state + repeat if self.random_state else None)
++                X_permuted[:, feature_idx] = rng.permutation(X_permuted[:, feature_idx])
++                
++                # Calculate accuracy with permuted feature
++                permuted_acc = accuracy_score(y, self.predict(X_permuted))
++                
++                # Importance is the decrease in accuracy
++                feature_scores.append(baseline_acc - permuted_acc)
++            
++            # Average importance across repeats
++            importances[feature_idx] = np.mean(feature_scores)
++            
++            print(f"Feature {feature_idx}: {importances[feature_idx]:.4f}")
++        
++        return importances
++    
++    def visualize_feature_importance(self, X, y, feature_names=None, n_repeats=10, save_plot=False):
++        """
++        Calculate and visualize feature importance.
++        
++        Args:
++            X: Feature matrix
++            y: Target labels
++            feature_names: Optional list of feature names
++            n_repeats: Number of permutation repeats
++            save_plot: Whether to save the plot as PNG
++            
++        Returns:
++            feature_importance: Array of importance scores
++        """
++        # Calculate feature importance
++        importance = self.get_feature_importance(X, y, n_repeats)
++        
++        # Create feature names if not provided
++        if feature_names is None:
++            feature_names = [f'Feature {i}' for i in range(len(importance))]
++        
++        # Sort features by importance
++        sorted_indices = np.argsort(importance)[::-1]
++        sorted_importance = importance[sorted_indices]
++        sorted_names = [feature_names[i] for i in sorted_indices]
++        
++        # Create visualization
++        plt.figure(figsize=(10, 6))
++        bars = plt.bar(range(len(sorted_importance)), sorted_importance, color='steelblue', alpha=0.7)
++        plt.xlabel('Features')
++        plt.ylabel('Permutation Importance (Accuracy Decrease)')
++        plt.title('Feature Importance - Bootstrap Weighted Oblique Random Forest')
++        plt.xticks(range(len(sorted_names)), sorted_names, rotation=45, ha='right')
++        plt.grid(axis='y', alpha=0.3)
++        
++        # Add value labels on bars
++        for bar, importance_val in zip(bars, sorted_importance):
++            height = bar.get_height()
++            plt.text(bar.get_x() + bar.get_width()/2., height + max(sorted_importance)*0.01,
++                    f'{importance_val:.3f}', ha='center', va='bottom', fontsize=9)
++        
++        plt.tight_layout()
++        
++        if save_plot:
++            plt.savefig('bworf_feature_importance.png', dpi=300, bbox_inches='tight')
++            print("Feature importance plot saved as 'bworf_feature_importance.png'")
++        else:
++            plt.show()
++        
++        return importance
++
++
++def apply_mutual_information_filtering(X_train, X_test, y_train, top_k_features=None, plot_mi=True):
++    """
++    Apply mutual information-based feature filtering.
++    
++    Args:
++        X_train: Training feature matrix
++        X_test: Test feature matrix
++        y_train: Training target labels
++        top_k_features: Number of top features to keep (if None, uses global top_k)
++        plot_mi: Whether to plot the top 20 MI features
++        
++    Returns:
++        X_train_filtered: Filtered training features
++        X_test_filtered: Filtered test features
++        selected_feature_indices: Indices of selected features
++        mi_scores: Mutual information scores for all features
++    """
++    if top_k_features is None:
++        top_k_features = top_k
++    
++    print(f"\nApplying Mutual Information-based feature filtering...")
++    print(f"Original number of features: {X_train.shape[1]}")
++    print(f"Target number of features: {top_k_features}")
++    
++    # Handle NaN values by imputing with median for numerical features
++    from sklearn.impute import SimpleImputer
++    print("Checking for and handling missing values...")
++    
++    # Check if there are any NaN values
++    if np.any(np.isnan(X_train)):
++        print("  Found NaN values, applying median imputation...")
++        # Use median imputation for numerical features
++        imputer = SimpleImputer(strategy='median')
++        X_train_imputed = imputer.fit_transform(X_train)
++        X_test_imputed = imputer.transform(X_test)
++        
++        print(f"  Imputed {np.sum(np.isnan(X_train))} NaN values in training data")
++        print(f"  Imputed {np.sum(np.isnan(X_test))} NaN values in test data")
++    else:
++        print("  No NaN values found")
++        X_train_imputed = X_train
++        X_test_imputed = X_test
++
++    # Allow MI filtering to be relaxed without rewriting the workflow.
++    if top_k_features is None or top_k_features <= 0 or top_k_features >= X_train_imputed.shape[1]:
++        print("MI filtering relaxed/bypassed; returning all features unchanged.")
++        selected_feature_indices = np.arange(X_train_imputed.shape[1])
++        return X_train_imputed, X_test_imputed, selected_feature_indices, None
++    
++    # Compute mutual information between each feature and the target y_train
++    print("Computing mutual information scores...")
++    mi_scores = mutual_info_classif(X_train_imputed, y_train, random_state=42)
++    
++    # Rank features by MI score
++    feature_rankings = np.argsort(mi_scores)[::-1]  # Descending order
++    
++    # Keep the top K features
++    selected_feature_indices = feature_rankings[:top_k_features]
++    
++    # Apply filtering to both X_train and X_test (using imputed data)
++    X_train_filtered = X_train_imputed[:, selected_feature_indices]
++    X_test_filtered = X_test_imputed[:, selected_feature_indices]
++    
++    print(f"Selected {len(selected_feature_indices)} features based on MI scores")
++    
++    # Optionally print the top 20 feature scores
++    print(f"\nTop 20 features by Mutual Information score:")
++    for i in range(min(20, len(mi_scores))):
++        feature_idx = feature_rankings[i]
++        print(f"  {i+1:2d}. Feature {feature_idx:2d}: MI = {mi_scores[feature_idx]:.4f}")
++    
++    # Optionally plot the top 20 MI features using matplotlib
++    if plot_mi:
++        plot_mutual_information_scores(mi_scores, feature_rankings, top_features=20)
++    
++    return X_train_filtered, X_test_filtered, selected_feature_indices, mi_scores
++
++
++def plot_mutual_information_scores(mi_scores, feature_rankings, top_features=20):
++    """
++    Plot the top mutual information features.
++    
++    Args:
++        mi_scores: Array of mutual information scores
++        feature_rankings: Feature indices sorted by MI score (descending)
++        top_features: Number of top features to plot
++    """
++    print(f"\nGenerating Mutual Information plot for top {top_features} features...")
++    
++    # Get top features for plotting
++    top_indices = feature_rankings[:top_features]
++    top_scores = mi_scores[top_indices]
++    feature_names = [f'Feature {i}' for i in top_indices]
++    
++    # Create the plot
++    plt.figure(figsize=(12, 8))
++    bars = plt.bar(range(len(top_scores)), top_scores, color='darkgreen', alpha=0.7)
++    
++    plt.xlabel('Features (Ranked by MI Score)')
++    plt.ylabel('Mutual Information Score')
++    plt.title(f'Top {top_features} Features by Mutual Information with Target')
++    plt.xticks(range(len(feature_names)), feature_names, rotation=45, ha='right')
++    plt.grid(axis='y', alpha=0.3)
++    
++    # Add value labels on bars
++    for bar, score in zip(bars, top_scores):
++        height = bar.get_height()
++        plt.text(bar.get_x() + bar.get_width()/2., height + max(top_scores)*0.01,
++                f'{score:.3f}', ha='center', va='bottom', fontsize=9)
++    
++    plt.tight_layout()
++    plt.savefig('mutual_information_features.png', dpi=300, bbox_inches='tight')
++    print("Mutual Information plot saved as 'mutual_information_features.png'")
++    plt.show()
++
++
++def evaluate_and_visualize(y_test, y_pred_bworf, y_pred_rf, y_proba_bworf, y_proba_rf, acc_bworf, acc_rf, f1_bworf, f1_rf):
++    """
++    Generate confusion matrices, ROC curves, and performance visualization.
++    
++    Args:
++        y_test: True test labels
++        y_pred_bworf: BWORF predictions
++        y_pred_rf: Standard RF predictions
++        y_proba_bworf: BWORF class probabilities
++        y_proba_rf: Standard RF class probabilities
++        acc_bworf, acc_rf: Accuracy scores
++        f1_bworf, f1_rf: F1 scores
++    """
++    print("\nGenerating confusion matrices...")
++    
++    # Create figure with two subplots
++    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
++    
++    # BWORF confusion matrix
++    cm_bworf = confusion_matrix(y_test, y_pred_bworf)
++    disp_bworf = ConfusionMatrixDisplay(
++        confusion_matrix=cm_bworf, 
++        display_labels=[f'DILI-{i}' for i in range(6)]
++    )
++    disp_bworf.plot(ax=axes[0], cmap='Blues', values_format='d')
++    bworf_title_suffix = " (with MI Filtering)" if use_mi_filter else ""
++    axes[0].set_title(f'Bootstrap Weighted Oblique RF{bworf_title_suffix}\nAccuracy: {acc_bworf:.4f} | Macro F1: {f1_bworf:.4f}')
++    
++    # Standard RF confusion matrix
++    cm_rf = confusion_matrix(y_test, y_pred_rf)
++    disp_rf = ConfusionMatrixDisplay(
++        confusion_matrix=cm_rf, 
++        display_labels=[f'DILI-{i}' for i in range(6)]
++    )
++    disp_rf.plot(ax=axes[1], cmap='Greens', values_format='d')
++    axes[1].set_title(f'Standard Random Forest (Original Features)\nAccuracy: {acc_rf:.4f} | Macro F1: {f1_rf:.4f}')
++    
++    plt.tight_layout()
++    plt.show()
++    
++    # Generate ROC curves for multiclass classification
++    print("\nGenerating ROC curves for each class...")
++    
++    # Create figure for ROC curves
++    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
++    
++    class_names = [f'DILI-{i}' for i in range(6)]
++    colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33']
++    
++    # ROC curves for BWORF
++    mean_auc_bworf = 0
++    for i in range(6):
++        y_true_binary = (y_test == i).astype(int)
++        y_score = y_proba_bworf[:, i]
++        
++        fpr, tpr, _ = roc_curve(y_true_binary, y_score)
++        roc_auc = auc(fpr, tpr)
++        mean_auc_bworf += roc_auc
++        
++        ax1.plot(fpr, tpr, color=colors[i], lw=2, 
++                label=f'{class_names[i]} (AUC = {roc_auc:.3f})')
++    
++    mean_auc_bworf /= 6
++    ax1.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.8)
++    ax1.set_xlim([0.0, 1.0])
++    ax1.set_ylim([0.0, 1.05])
++    ax1.set_xlabel('False Positive Rate')
++    ax1.set_ylabel('True Positive Rate')
++    bworf_roc_title = f'Bootstrap Weighted Oblique RF{bworf_title_suffix} - ROC Curves\nMean AUC = {mean_auc_bworf:.3f}'
++    ax1.set_title(bworf_roc_title)
++    ax1.legend(loc="lower right", fontsize=9)
++    ax1.grid(True, alpha=0.3)
++    
++    # ROC curves for Standard RF
++    mean_auc_rf = 0
++    for i in range(6):
++        y_true_binary = (y_test == i).astype(int)
++        y_score = y_proba_rf[:, i]
++        
++        fpr, tpr, _ = roc_curve(y_true_binary, y_score)
++        roc_auc = auc(fpr, tpr)
++        mean_auc_rf += roc_auc
++        
++        ax2.plot(fpr, tpr, color=colors[i], lw=2, 
++                label=f'{class_names[i]} (AUC = {roc_auc:.3f})')
++    
++    mean_auc_rf /= 6
++    ax2.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.8)
++    ax2.set_xlim([0.0, 1.0])
++    ax2.set_ylim([0.0, 1.05])
++    ax2.set_xlabel('False Positive Rate')
++    ax2.set_ylabel('True Positive Rate')
++    ax2.set_title(f'Standard RF (Original Features) - ROC Curves\nMean AUC = {mean_auc_rf:.3f}')
++    ax2.legend(loc="lower right", fontsize=9)
++    ax2.grid(True, alpha=0.3)
++    
++    plt.tight_layout()
++    plt.show()
++    
++    # Print detailed performance comparison
++    print("\n" + "="*60)
++    print("DETAILED PERFORMANCE ANALYSIS")
++    print("="*60)
++    
++    improvement_acc = ((acc_bworf - acc_rf) / acc_rf) * 100
++    improvement_f1 = ((f1_bworf - f1_rf) / f1_rf) * 100
++    improvement_auc = ((mean_auc_bworf - mean_auc_rf) / mean_auc_rf) * 100
++    
++    if use_mi_filter:
++        comparison_description = "Enhanced BWORF (with MI Filtering) vs Standard RF (Original Features)"
++    else:
++        comparison_description = "BWORF vs Standard RF (both using Original Features)"
++    
++    print(f"Comparison: {comparison_description}")
++    print(f"Bootstrap Weighted Oblique RF{' (with MI Filtering)' if use_mi_filter else ''}:")
++    print(f"  - Accuracy:  {acc_bworf:.4f}")
++    print(f"  - Macro F1:  {f1_bworf:.4f}")
++    print(f"  - Mean AUC:  {mean_auc_bworf:.4f}")
++    print(f"\nStandard RF (Original Features):")
++    print(f"  - Accuracy:  {acc_rf:.4f}")
++    print(f"  - Macro F1:  {f1_rf:.4f}")
++    print(f"  - Mean AUC:  {mean_auc_rf:.4f}")
++    print(f"\nImprovement:")
++    print(f"  - Accuracy:  {improvement_acc:+.2f}%")
++    print(f"  - Macro F1:  {improvement_f1:+.2f}%")
++    print(f"  - Mean AUC:  {improvement_auc:+.2f}%")
++
++
++def visualize_comprehensive_cv_results(bworf_results, rf_results):
++    """
++    Create comprehensive visualizations comparing the cross-validation results.
++    
++    Args:
++        bworf_results: Dictionary with BWORF individual scores
++        rf_results: Dictionary with Standard RF individual scores
++    """
++    print("\nGenerating comprehensive comparison visualizations...")
++    
++    # Extract data
++    bworf_acc = bworf_results['accuracies']
++    bworf_f1 = bworf_results['f1_scores']
++    bworf_auroc = bworf_results['auroc_scores']
++    bworf_mcc = bworf_results['mcc_scores']
++    bworf_precision = bworf_results['precision_scores']
++    bworf_recall = bworf_results['recall_scores']
++    
++    rf_acc = rf_results['accuracies']
++    rf_f1 = rf_results['f1_scores']
++    rf_auroc = rf_results['auroc_scores']
++    rf_mcc = rf_results['mcc_scores']
++    rf_precision = rf_results['precision_scores']
++    rf_recall = rf_results['recall_scores']
++    
++    # Create comprehensive comparison plots
++    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
++    
++    # Add comparison description to title
++    if use_mi_filter:
++        comparison_title = "Enhanced BWORF (MI Filtered) vs Standard RF (Original)"
++    else:
++        comparison_title = "BWORF vs Standard RF (Both Original Features)"
++    fig.suptitle(f'10-Fold Cross-Validation Results - {comparison_title}', fontsize=16, fontweight='bold')
++    
++    # 1. Box plots for all metrics
++    ax1 = axes[0, 0]
++    metrics_data = [bworf_acc, rf_acc, bworf_f1, rf_f1, bworf_auroc, rf_auroc]
++    metrics_labels = ['BWORF\nAccuracy', 'RF\nAccuracy', 'BWORF\nMacro F1', 'RF\nMacro F1', 'BWORF\nAUROC', 'RF\nAUROC']
++    colors = ['lightblue', 'lightcoral', 'lightgreen', 'orange', 'plum', 'khaki']
++    
++    box_plot = ax1.boxplot(metrics_data, labels=metrics_labels, patch_artist=True)
++    for patch, color in zip(box_plot['boxes'], colors):
++        patch.set_facecolor(color)
++    
++    ax1.set_title('10-Fold CV Performance Distribution\n(Primary Metrics)')
++    ax1.set_ylabel('Score')
++    ax1.grid(True, alpha=0.3)
++    
++    # 2. Box plots for additional metrics
++    ax2 = axes[0, 1]
++    additional_metrics_data = [bworf_mcc, rf_mcc, bworf_precision, rf_precision, bworf_recall, rf_recall]
++    additional_labels = ['BWORF\nMCC', 'RF\nMCC', 'BWORF\nPrecision', 'RF\nPrecision', 'BWORF\nRecall', 'RF\nRecall']
++    additional_colors = ['lightsteelblue', 'mistyrose', 'lightcyan', 'peachpuff', 'lavender', 'lemonchiffon']
++    
++    box_plot2 = ax2.boxplot(additional_metrics_data, labels=additional_labels, patch_artist=True)
++    for patch, color in zip(box_plot2['boxes'], additional_colors):
++        patch.set_facecolor(color)
++    
++    ax2.set_title('10-Fold CV Performance Distribution\n(Additional Metrics)')
++    ax2.set_ylabel('Score')
++    ax2.grid(True, alpha=0.3)
++    
++    # 3. Fold-by-fold accuracy comparison
++    ax3 = axes[0, 2]
++    folds = range(1, 11)
++    ax3.plot(folds, bworf_acc, 'b-o', label='BWORF', linewidth=2, markersize=6)
++    ax3.plot(folds, rf_acc, 'r-s', label='Standard RF', linewidth=2, markersize=6)
++    ax3.set_title('Accuracy Across Folds')
++    ax3.set_xlabel('Fold')
++    ax3.set_ylabel('Accuracy')
++    ax3.legend()
++    ax3.grid(True, alpha=0.3)
++    
++    # 4. Fold-by-fold F1 comparison
++    ax4 = axes[1, 0]
++    ax4.plot(folds, bworf_f1, 'b-o', label='BWORF', linewidth=2, markersize=6)
++    ax4.plot(folds, rf_f1, 'r-s', label='Standard RF', linewidth=2, markersize=6)
++    ax4.set_title('Macro F1 Across Folds')
++    ax4.set_xlabel('Fold')
++    ax4.set_ylabel('Macro F1')
++    ax4.legend()
++    ax4.grid(True, alpha=0.3)
++    
++    # 5. Fold-by-fold AUROC comparison
++    ax5 = axes[1, 1]
++    ax5.plot(folds, bworf_auroc, 'b-o', label='BWORF', linewidth=2, markersize=6)
++    ax5.plot(folds, rf_auroc, 'r-s', label='Standard RF', linewidth=2, markersize=6)
++    ax5.set_title('AUROC Across Folds')
++    ax5.set_xlabel('Fold')
++    ax5.set_ylabel('AUROC')
++    ax5.legend()
++    ax5.grid(True, alpha=0.3)
++    
++    # 6. Improvement per fold across all metrics
++    ax6 = axes[1, 2]
++    acc_improvements = [(b - r) / r * 100 for b, r in zip(bworf_acc, rf_acc)]
++    f1_improvements = [(b - r) / r * 100 for b, r in zip(bworf_f1, rf_f1)]
++    auroc_improvements = [(b - r) / r * 100 for b, r in zip(bworf_auroc, rf_auroc)]
++    mcc_improvements = [(b - r) / r * 100 if r != 0 else 0 for b, r in zip(bworf_mcc, rf_mcc)]
++    
++    ax6.plot(folds, acc_improvements, 'g-o', label='Accuracy', linewidth=2, markersize=6)
++    ax6.plot(folds, f1_improvements, 'b-s', label='Macro F1', linewidth=2, markersize=6)
++    ax6.plot(folds, auroc_improvements, 'm-^', label='AUROC', linewidth=2, markersize=6)
++    ax6.plot(folds, mcc_improvements, 'c-d', label='MCC', linewidth=2, markersize=6)
++    ax6.axhline(y=0, color='k', linestyle='--', alpha=0.5)
++    ax6.set_title('BWORF Improvement Over Standard RF (%)')
++    ax6.set_xlabel('Fold')
++    ax6.set_ylabel('Improvement (%)')
++    ax6.legend()
++    ax6.grid(True, alpha=0.3)
++    
++    plt.tight_layout()
++    plt.show()
++
++
++def test_debug_trace(test_weighted_bootstrap=False):
++    """
++    Lightweight test to verify debug trace mode and CART-style threshold optimization.
++    
++    This test creates a small random dataset and trains a single BWORF tree with debug_trace=True
++    to verify that:
++    1. Explicit node weights ω_i^(t) are computed (raw vs normalized)
++    2. CART-style threshold optimization is performed (not just using -intercept)
++    3. Debug output is generated for the first few nodes
++    4. n_tries parameter is correctly wired and used
++    5. (Optional) Weighted bootstrap sampling is working correctly
++    
++    Args:
++        test_weighted_bootstrap: If True, also test weighted bootstrap mode
++    """
++    print("="*90)
++    print("DEBUG TRACE TEST FOR BWORF")
++    print("="*90)
++    print("\nTesting explicit node weights and CART-style threshold optimization...")
++    
++    # Create a small random dataset
++    np.random.seed(42)
++    X_test = np.random.randn(100, 5)
++    y_test = np.random.randint(0, 3, size=100)  # 3 classes
++    
++    print(f"\nTest dataset: {X_test.shape[0]} samples, {X_test.shape[1]} features, {len(np.unique(y_test))} classes")
++    print(f"Class distribution: {dict(Counter(y_test))}")
++    
++    # Train a single tree with debug trace enabled (standard bootstrap)
++    print("\n" + "="*90)
++    print("TEST 1: Standard uniform bootstrap with debug_trace=True (first 3 nodes traced)")
++    print("Using n_tries=5 to verify parameter wiring")
++    print("="*90)
++    
++    bworf_debug = ObliqueRandomForestMulti(
++        n_estimators=1,  # Just one tree for testing
++        max_depth=3,
++        min_samples_split=10,
++        min_samples_leaf=3,
++        l1_strength=1.0,
++        random_state=42,
++        debug_trace=True,
++        debug_max_nodes=3,
++        weighted_bootstrap=True,
++        n_tries=5  # Test n_tries parameter
++    )
++    
++    bworf_debug.fit(X_test, y_test)
++    
++    # Make predictions to verify the tree works
++    y_pred = bworf_debug.predict(X_test)
++    accuracy = accuracy_score(y_test, y_pred)
++    
++    print("\n" + "="*90)
++    print(f"Test 1 complete! Training accuracy: {accuracy:.3f}")
++    print("Verify that:")
++    print("  1. Raw weight sums ≈ n_samples, normalized weight sums ≈ 1.0")
++    print("  2. Intercept threshold vs CART threshold are shown and may differ")
++    print("  3. Weighted Gini is computed correctly")
++    print("  4. n_tries=5 is shown in debug output for split attempts")
++    print("="*90)
++    
++    # Test weighted bootstrap if requested
++    if test_weighted_bootstrap:
++        print("\n" + "="*90)
++        print("TEST 2: Weighted bootstrap with debug_trace=True")
++        print("="*90)
++        
++        bworf_weighted = ObliqueRandomForestMulti(
++            n_estimators=1,
++            max_depth=3,
++            min_samples_split=10,
++            min_samples_leaf=3,
++            l1_strength=1.0,
++            random_state=42,
++            debug_trace=True,
++            debug_max_nodes=3,
++            weighted_bootstrap=True,
++            bootstrap_weight_mode="balanced",
++            bootstrap_temperature=1.0
++        )
++        
++        bworf_weighted.fit(X_test, y_test)
++        
++        # Make predictions
++        y_pred_weighted = bworf_weighted.predict(X_test)
++        accuracy_weighted = accuracy_score(y_test, y_pred_weighted)
++        
++        print("\n" + "="*90)
++        print(f"Test 2 complete! Training accuracy: {accuracy_weighted:.3f}")
++        print("Verify that:")
++        print("  1. Bootstrap probability summary was printed")
++        print("  2. sum(p_i) = 1.0")
++        print("  3. Minority classes have higher sampling probabilities")
++        print("="*90)
++
++
++def main():
++    """
++    Main function demonstrating Bootstrap and Weighted Oblique Random Forest (BWORF) with Mutual Information filtering and comprehensive 10-fold CV.
++    """
++    print("="*90)
++    print("BOOTSTRAP AND WEIGHTED OBLIQUE RANDOM FOREST (BWORF) WITH MUTUAL INFORMATION FILTERING")
++    print("="*90)
++    
++    # Display filtering configuration
++    filtering_status = "ENABLED" if use_mi_filter else "DISABLED"
++    print(f"\nMutual Information Filtering: {filtering_status}")
++    if use_mi_filter:
++        print(f"Top K features to select: {top_k}")
++    
++    # 1. Generate synthetic dataset with oblique boundaries
++    print("\n1. DATA GENERATION")
++    print("-" * 20)
++    X, y = generate_rotated_dataset()
++    
++    # Ensure arrays are numpy arrays
++    X = np.asarray(X)
++    y = np.asarray(y)
++    
++    print(f"Dataset shape: {X.shape}")
++    print(f"Number of classes: {len(np.unique(y))}")
++    print(f"Class distribution: {dict(Counter(y))}")
++    
++    # 2. Set up 10-fold stratified cross-validation
++    print("\n2. COMPREHENSIVE 10-FOLD CROSS-VALIDATION SETUP")
++    print("-" * 50)
++    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
++    
++    # Storage for results across folds - COMPREHENSIVE METRICS
++    bworf_results = {
++        'accuracies': [], 'f1_scores': [], 'auroc_scores': [], 
++        'mcc_scores': [], 'precision_scores': [], 'recall_scores': []
++    }
++    rf_results = {
++        'accuracies': [], 'f1_scores': [], 'auroc_scores': [], 
++        'mcc_scores': [], 'precision_scores': [], 'recall_scores': []
++    }
++    
++    # Label binarizer for multiclass AUROC
++    lb = LabelBinarizer()
++    lb.fit(y)
++    
++    fold_num = 1
++    
++    # Store data from last fold for detailed visualization
++    last_fold_data = {}
++    
++    print(f"Running comprehensive 10-fold cross-validation...")
++    print(f"Each fold uses ~{len(X) * 0.9:.0f} training and ~{len(X) * 0.1:.0f} test samples")
++    print(f"Tracking 6 metrics: Accuracy, F1, AUROC, MCC, Precision, Recall")
++    
++    # 3. Run cross-validation with comprehensive metrics
++    for train_idx, test_idx in skf.split(X, y):
++        print(f"\n{'='*50}")
++        print(f"FOLD {fold_num}/10")
++        print(f"{'='*50}")
++        
++        # Split data for this fold
++        X_train, X_test = X[train_idx], X[test_idx]
++        y_train, y_test = y[train_idx], y[test_idx]
++        
++        print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
++        print(f"Train class distribution: {dict(Counter(y_train))}")
++        print(f"Test class distribution:  {dict(Counter(y_test))}")
++        
++        # Apply Mutual Information filtering for BWORF only if enabled
++        if use_mi_filter:
++            print(f"\n--- Applying Mutual Information filtering for BWORF only (Fold {fold_num}) ---")
++            X_train_bworf, X_test_bworf, selected_features, mi_scores = apply_mutual_information_filtering(
++                X_train, X_test, y_train, top_k_features=top_k, plot_mi=(fold_num == 1)  # Only plot for first fold
++            )
++            print(f"BWORF features after MI filtering: {X_train_bworf.shape[1]}")
++            print(f"Standard RF uses original features: {X_train.shape[1]}")
++        else:
++            print(f"\nSkipping Mutual Information filtering (disabled)")
++            X_train_bworf, X_test_bworf = X_train, X_test
++        
++        # Train Bootstrap and Weighted Oblique Random Forest (with MI filtering if enabled)
++        print(f"\nTraining BWORF (Fold {fold_num})...")
++        bworf = ObliqueRandomForestMulti(
++            n_estimators=10,  # Reduced for faster CV
++            max_depth=3,
++            min_samples_split=10,
++            min_samples_leaf=5,
++            l1_strength=1.0,
++            random_state=42 + fold_num,  # Different seed per fold
++            weighted_bootstrap=True,
++            n_tries=10
++        )
++        bworf.fit(X_train_bworf, y_train)
++        
++        # Train Standard Random Forest (always uses original features for fair baseline comparison)
++        print(f"Training Standard RF (Fold {fold_num})...")
++        rf = RandomForestClassifier(
++            n_estimators=10,  # Match BWORF
++            max_depth=3,
++            min_samples_split=10,
++            min_samples_leaf=5,
++            random_state=42 + fold_num  # Different seed per fold
++        )
++        rf.fit(X_train, y_train)  # Uses original unfiltered features
++        
++        # Make predictions
++        print(f"Making predictions and calculating comprehensive metrics (Fold {fold_num})...")
++        y_pred_bworf = bworf.predict(X_test_bworf)  # BWORF uses filtered features
++        y_pred_rf = rf.predict(X_test)  # Standard RF uses original features
++        y_proba_bworf = bworf.predict_proba(X_test_bworf)  # BWORF uses filtered features
++        y_proba_rf = rf.predict_proba(X_test)  # Standard RF uses original features
++        
++        # Ensure probability arrays are numpy arrays
++        y_proba_bworf = np.asarray(y_proba_bworf)
++        y_proba_rf = np.asarray(y_proba_rf)
++        
++        # Calculate comprehensive metrics for BWORF
++        acc_bworf = accuracy_score(y_test, y_pred_bworf)
++        f1_bworf = f1_score(y_test, y_pred_bworf, average='macro')
++        mcc_bworf = matthews_corrcoef(y_test, y_pred_bworf)
++        precision_bworf = precision_score(y_test, y_pred_bworf, average='macro')
++        recall_bworf = recall_score(y_test, y_pred_bworf, average='macro')
++        
++        # Calculate AUROC for BWORF
++        try:
++            y_test_binarized = lb.transform(y_test)
++            auroc_bworf = roc_auc_score(y_test_binarized, y_proba_bworf, average='macro', multi_class='ovr')
++        except Exception:
++            auroc_bworf = 0.5  # Default if calculation fails
++        
++        # Calculate comprehensive metrics for Standard RF
++        acc_rf = accuracy_score(y_test, y_pred_rf)
++        f1_rf = f1_score(y_test, y_pred_rf, average='macro')
++        mcc_rf = matthews_corrcoef(y_test, y_pred_rf)
++        precision_rf = precision_score(y_test, y_pred_rf, average='macro')
++        recall_rf = recall_score(y_test, y_pred_rf, average='macro')
++        
++        # Calculate AUROC for Standard RF
++        try:
++            auroc_rf = roc_auc_score(y_test_binarized, y_proba_rf, average='macro', multi_class='ovr')
++        except Exception:
++            auroc_rf = 0.5  # Default if calculation fails
++        
++        # Store comprehensive results
++        bworf_results['accuracies'].append(acc_bworf)
++        bworf_results['f1_scores'].append(f1_bworf)
++        bworf_results['auroc_scores'].append(auroc_bworf)
++        bworf_results['mcc_scores'].append(mcc_bworf)
++        bworf_results['precision_scores'].append(precision_bworf)
++        bworf_results['recall_scores'].append(recall_bworf)
++        
++        rf_results['accuracies'].append(acc_rf)
++        rf_results['f1_scores'].append(f1_rf)
++        rf_results['auroc_scores'].append(auroc_rf)
++        rf_results['mcc_scores'].append(mcc_rf)
++        rf_results['precision_scores'].append(precision_rf)
++        rf_results['recall_scores'].append(recall_rf)
++        
++        # Display comprehensive fold results
++        print(f"\nFOLD {fold_num} COMPREHENSIVE RESULTS:")
++        print(f"BWORF    - Acc: {acc_bworf:.4f}, F1: {f1_bworf:.4f}, AUROC: {auroc_bworf:.4f}, MCC: {mcc_bworf:.4f}, Prec: {precision_bworf:.4f}, Rec: {recall_bworf:.4f}")
++        print(f"Std RF   - Acc: {acc_rf:.4f}, F1: {f1_rf:.4f}, AUROC: {auroc_rf:.4f}, MCC: {mcc_rf:.4f}, Prec: {precision_rf:.4f}, Rec: {recall_rf:.4f}")
++        
++        # Calculate improvements
++        acc_imp = ((acc_bworf - acc_rf) / acc_rf * 100) if acc_rf != 0 else 0
++        f1_imp = ((f1_bworf - f1_rf) / f1_rf * 100) if f1_rf != 0 else 0
++        auroc_imp = ((auroc_bworf - auroc_rf) / auroc_rf * 100) if auroc_rf != 0 else 0
++        mcc_imp = ((mcc_bworf - mcc_rf) / mcc_rf * 100) if mcc_rf != 0 else 0
++        prec_imp = ((precision_bworf - precision_rf) / precision_rf * 100) if precision_rf != 0 else 0
++        rec_imp = ((recall_bworf - recall_rf) / recall_rf * 100) if recall_rf != 0 else 0
++        
++        print(f"Improvement: Acc {acc_imp:+.1f}%, F1 {f1_imp:+.1f}%, AUROC {auroc_imp:+.1f}%, MCC {mcc_imp:+.1f}%, Prec {prec_imp:+.1f}%, Rec {rec_imp:+.1f}%")
++        
++        # Store last fold data for detailed visualization
++        if fold_num == 10:
++            last_fold_data = {
++                'y_test': y_test,
++                'y_pred_bworf': y_pred_bworf,
++                'y_pred_rf': y_pred_rf,
++                'y_proba_bworf': y_proba_bworf,
++                'y_proba_rf': y_proba_rf,
++                'acc_bworf': acc_bworf,
++                'acc_rf': acc_rf,
++                'f1_bworf': f1_bworf,
++                'f1_rf': f1_rf
++            }
++        
++        fold_num += 1
++    
++    # 4. Calculate and display comprehensive overall results
++    print("\n" + "="*80)
++    print("COMPREHENSIVE 10-FOLD CROSS-VALIDATION RESULTS")
++    print("="*80)
++    
++    # Convert to numpy arrays for easy calculation
++    bworf_acc_arr = np.array(bworf_results['accuracies'])
++    bworf_f1_arr = np.array(bworf_results['f1_scores'])
++    bworf_auroc_arr = np.array(bworf_results['auroc_scores'])
++    bworf_mcc_arr = np.array(bworf_results['mcc_scores'])
++    bworf_precision_arr = np.array(bworf_results['precision_scores'])
++    bworf_recall_arr = np.array(bworf_results['recall_scores'])
++    
++    rf_acc_arr = np.array(rf_results['accuracies'])
++    rf_f1_arr = np.array(rf_results['f1_scores'])
++    rf_auroc_arr = np.array(rf_results['auroc_scores'])
++    rf_mcc_arr = np.array(rf_results['mcc_scores'])
++    rf_precision_arr = np.array(rf_results['precision_scores'])
++    rf_recall_arr = np.array(rf_results['recall_scores'])
++    
++    # Display comparison description
++    if use_mi_filter:
++        comparison_status = "Enhanced BWORF (with MI Filtering) vs Standard RF (Original Features)"
++    else:
++        comparison_status = "BWORF vs Standard RF (both using Original Features)"
++    
++    print(f"\nComparison: {comparison_status}")
++    
++    # Display comprehensive means and standard deviations
++    print(f"\nBootstrap Weighted Oblique Random Forest{' (with MI Filtering)' if use_mi_filter else ''}:")
++    print(f"  Accuracy:   {bworf_acc_arr.mean():.4f} ± {bworf_acc_arr.std():.4f}")
++    print(f"  Macro F1:   {bworf_f1_arr.mean():.4f} ± {bworf_f1_arr.std():.4f}")
++    print(f"  AUROC:      {bworf_auroc_arr.mean():.4f} ± {bworf_auroc_arr.std():.4f}")
++    print(f"  MCC:        {bworf_mcc_arr.mean():.4f} ± {bworf_mcc_arr.std():.4f}")
++    print(f"  Precision:  {bworf_precision_arr.mean():.4f} ± {bworf_precision_arr.std():.4f}")
++    print(f"  Recall:     {bworf_recall_arr.mean():.4f} ± {bworf_recall_arr.std():.4f}")
++    
++    print(f"\nStandard Random Forest (Original Features):")
++    print(f"  Accuracy:   {rf_acc_arr.mean():.4f} ± {rf_acc_arr.std():.4f}")
++    print(f"  Macro F1:   {rf_f1_arr.mean():.4f} ± {rf_f1_arr.std():.4f}")
++    print(f"  AUROC:      {rf_auroc_arr.mean():.4f} ± {rf_auroc_arr.std():.4f}")
++    print(f"  MCC:        {rf_mcc_arr.mean():.4f} ± {rf_mcc_arr.std():.4f}")
++    print(f"  Precision:  {rf_precision_arr.mean():.4f} ± {rf_precision_arr.std():.4f}")
++    print(f"  Recall:     {rf_recall_arr.mean():.4f} ± {rf_recall_arr.std():.4f}")
++    
++    # Calculate comprehensive improvements
++    print(f"\nOverall Improvement (BWORF vs Standard RF):")
++    for metric_name, bworf_scores, rf_scores in [
++        ('Accuracy', bworf_acc_arr, rf_acc_arr),
++        ('Macro F1', bworf_f1_arr, rf_f1_arr),
++        ('AUROC', bworf_auroc_arr, rf_auroc_arr),
++        ('MCC', bworf_mcc_arr, rf_mcc_arr),
++        ('Precision', bworf_precision_arr, rf_precision_arr),
++        ('Recall', bworf_recall_arr, rf_recall_arr)
++    ]:
++        improvement = ((bworf_scores.mean() - rf_scores.mean()) / rf_scores.mean()) * 100
++        print(f"  {metric_name:<10}: {improvement:+.2f}%")
++    
++    # Comprehensive statistical significance tests
++    print(f"\nStatistical Significance (Paired t-test):")
++    
++    for metric_name, bworf_scores, rf_scores in [
++        ('Accuracy', bworf_acc_arr, rf_acc_arr),
++        ('Macro F1', bworf_f1_arr, rf_f1_arr),
++        ('AUROC', bworf_auroc_arr, rf_auroc_arr),
++        ('MCC', bworf_mcc_arr, rf_mcc_arr),
++        ('Precision', bworf_precision_arr, rf_precision_arr),
++        ('Recall', bworf_recall_arr, rf_recall_arr)
++    ]:
++        t_stat, p_val = stats.ttest_rel(bworf_scores, rf_scores)
++        significance = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
++        print(f"  {metric_name:<10}: t={t_stat:.3f}, p={p_val:.4f} {significance}")
++    
++    print(f"\nSignificance: *** p<0.001, ** p<0.01, * p<0.05, ns = not significant")
++    
++    # 5. Generate comprehensive visualizations
++    print(f"\n5. COMPREHENSIVE VISUALIZATION")
++    print("-" * 35)
++    visualize_comprehensive_cv_results(bworf_results, rf_results)
++    
++    # 6. Detailed visualization from the last fold
++    if last_fold_data:
++        print(f"\n6. DETAILED VISUALIZATION (Fold 10 Results)")
++        print("-" * 45)
++        evaluate_and_visualize(
++            last_fold_data['y_test'],
++            last_fold_data['y_pred_bworf'],
++            last_fold_data['y_pred_rf'],
++            last_fold_data['y_proba_bworf'],
++            last_fold_data['y_proba_rf'],
++            last_fold_data['acc_bworf'],
++            last_fold_data['acc_rf'],
++            last_fold_data['f1_bworf'],
++            last_fold_data['f1_rf']
++        )
++    
++    # 7. Feature Importance Analysis (only if not using MI filtering to avoid confusion)
++    if not use_mi_filter:
++        print(f"\n7. FEATURE IMPORTANCE ANALYSIS")
++        print("-" * 35)
++        
++        # Use a single train-test split for feature importance (faster than full CV)
++        print("Training BWORF on full dataset for feature importance analysis...")
++        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
++        
++        # Train BWORF model
++        bworf_final = ObliqueRandomForestMulti(
++            n_estimators=10,
++            max_depth=3,
++            min_samples_split=10,
++            min_samples_leaf=5,
++            l1_strength=1.0,
++            random_state=42,
++            weighted_bootstrap=True,
++            n_tries=10
++        )
++        bworf_final.fit(X_train, y_train)
++        
++        # Calculate and visualize feature importance
++        print("\nCalculating feature importance (this may take a moment)...")
++        feature_names = [f'Rotated Feature {i}' for i in range(X.shape[1])]
++        
++        # Calculate importance with fewer repeats for speed
++        importance_scores = bworf_final.visualize_feature_importance(
++            X_test, y_test, 
++            feature_names=feature_names, 
++            n_repeats=5,  # Reduced repeats for speed
++            save_plot=True
++        )
++        
++        # Display summary
++        print(f"\nFeature Importance Summary:")
++        sorted_indices = np.argsort(importance_scores)[::-1]
++        for i, idx in enumerate(sorted_indices[:5]):  # Top 5 features
++            print(f"  {i+1}. {feature_names[idx]}: {importance_scores[idx]:.4f}")
++    else:
++        print(f"\n7. FEATURE IMPORTANCE ANALYSIS SKIPPED")
++        print("-" * 40)
++        print("Feature importance analysis skipped when MI filtering is enabled")
++        print("to avoid confusion between MI-selected features and permutation importance.")
++    
++    print("\n" + "="*90)
++    print("COMPREHENSIVE 10-FOLD CV BWORF WITH MUTUAL INFORMATION FILTERING COMPLETED")
++    print("="*90)
++
++
++def test_l1_strength_robustness():
++    """
++    Unit test to verify BWORF handles l1_strength=0 and l1_strength>0 correctly.
++    
++    Tests:
++    1. l1_strength=0 doesn't crash (uses large C fallback)
++    2. l1_strength>0 works normally
++    3. predict_proba returns shape (n, 2) for binary
++    4. Probabilities sum to ~1
++    """
++    print("=" * 60)
++    print("TEST: L1 Strength Robustness")
++    print("=" * 60)
++    
++    # Generate simple binary test data
++    np.random.seed(42)
++    n_samples, n_features = 100, 10
++    X = np.random.randn(n_samples, n_features)
++    y = (X[:, 0] + X[:, 1] > 0).astype(int)  # Simple linear boundary
++    
++    test_cases = [
++        {"l1_strength": 0.0, "expected": "fallback to large C"},
++        {"l1_strength": -1.0, "expected": "fallback to large C"},
++        {"l1_strength": None, "expected": "fallback to large C"},
++        {"l1_strength": 1.0, "expected": "normal operation"},
++        {"l1_strength": 0.1, "expected": "normal operation"},
++    ]
++    
++    all_passed = True
++    
++    for i, tc in enumerate(test_cases):
++        l1_val = tc["l1_strength"]
++        print(f"\n[Test {i+1}] l1_strength={l1_val} ({tc['expected']})")
++        
++        try:
++            # Create and fit model
++            model = ObliqueRandomForestMulti(
++                n_estimators=5,  # Small for speed
++                max_depth=3,
++                min_samples_split=5,
++                min_samples_leaf=2,
++                l1_strength=l1_val,
++                random_state=42
++            )
++            model.fit(X, y)
++            
++            # Check predict_proba
++            proba = model.predict_proba(X)
++            
++            # Validate shape
++            if proba.shape != (n_samples, 2):
++                print(f"  FAIL: predict_proba shape {proba.shape}, expected ({n_samples}, 2)")
++                all_passed = False
++                continue
++            
++            # Validate probabilities sum to 1
++            row_sums = proba.sum(axis=1)
++            if not np.allclose(row_sums, 1.0, atol=1e-6):
++                print(f"  FAIL: Row sums not ~1.0, range [{row_sums.min():.4f}, {row_sums.max():.4f}]")
++                all_passed = False
++                continue
++            
++            # Validate values in [0, 1]
++            if not (np.all(proba >= 0) and np.all(proba <= 1)):
++                print(f"  FAIL: Probabilities outside [0,1]")
++                all_passed = False
++                continue
++            
++            print(f"  PASS: shape={proba.shape}, row_sums in [{row_sums.min():.4f}, {row_sums.max():.4f}]")
++            
++        except Exception as e:
++            print(f"  FAIL: Exception raised: {e}")
++            all_passed = False
++    
++    print("\n" + "=" * 60)
++    if all_passed:
++        print("ALL TESTS PASSED")
++    else:
++        print("SOME TESTS FAILED")
++    print("=" * 60)
++    
++    return all_passed
++
++
++# ==============================================================================
++# BWORFClassifier - Wrapper for v3 simulation study
++# ==============================================================================
++
++
++class BWORFClassifier(ObliqueRandomForestMulti):
++    """
++    BWORF (Bootstrap Weighted Oblique Random Forest) Classifier.
++    
++    This is the BWORF model used in the v3 simulation study. It is a thin wrapper
++    around ObliqueRandomForestMulti to provide a consistent import interface:
++    
++        from models.bworf_with_mi import BWORFClassifier
++    
++    Inherits all functionality from ObliqueRandomForestMulti including:
++    - L1-regularized oblique splits
++    - Weighted bootstrap sampling enabled by default (can be disabled explicitly)
++    - Multiclass classification support
++    - fit(X, y), predict(X), predict_proba(X) methods
++    """
++    
++    def __init__(
++        self,
++        n_estimators=100,
++        max_depth=5,
++        min_samples_split=10,
++        min_samples_leaf=5,
++        l1_strength=1.0,
++        random_state=None,
++        debug_trace=False,
++        debug_max_nodes=3,
++        weighted_bootstrap=True,
++        bootstrap_weight_mode="balanced",
++        bootstrap_temperature=1.0,
++        n_tries=10,
++    ):
++        """
++        Initialize BWORFClassifier.
++        
++        Parameters match ObliqueRandomForestMulti exactly. BWORFClassifier defaults to weighted_bootstrap=True and n_tries=10 so the wrapper reflects the intended BWORF configuration.
++        """
++        super().__init__(
++            n_estimators=n_estimators,
++            max_depth=max_depth,
++            min_samples_split=min_samples_split,
++            min_samples_leaf=min_samples_leaf,
++            l1_strength=l1_strength,
++            random_state=random_state,
++            debug_trace=debug_trace,
++            debug_max_nodes=debug_max_nodes,
++            weighted_bootstrap=weighted_bootstrap,
++            bootstrap_weight_mode=bootstrap_weight_mode,
++            bootstrap_temperature=bootstrap_temperature,
++            n_tries=n_tries,
++        )
++
++
++def test_weighted_leaf_consistency():
++    """
++    Unit test to verify leaf probabilities and terminal predictions remain
++    consistent with weighted node training statistics.
++    """
++    print("=" * 60)
++    print("TEST: Weighted Leaf Consistency")
++    print("=" * 60)
++
++    X = np.array([[0.0], [1.0], [2.0], [3.0], [4.0]])
++    y = np.array([0, 0, 0, 0, 1])
++
++    tree = ObliqueDecisionTreeMulti(max_depth=0, min_samples_split=10, min_samples_leaf=1, random_state=42)
++    tree.fit(X, y)
++
++    leaf = tree.tree
++    raw_predicted_class = int(np.argmax(leaf['class_counts']))
++    weighted_predicted_class = int(leaf['predicted_class'])
++    weighted_probs = np.asarray(leaf['class_probabilities'], dtype=float)
++
++    print(f"Raw class counts: {leaf['class_counts']}")
++    print(f"Weighted class probabilities: {np.round(weighted_probs, 4)}")
++    print(f"Raw-majority class: {raw_predicted_class}")
++    print(f"Weighted predicted class: {weighted_predicted_class}")
++
++    probs = tree.predict_proba(X[:1])[0]
++    print(f"predict_proba(first sample): {np.round(probs, 4)}")
++
++    passed = (
++        raw_predicted_class == 0
++        and weighted_predicted_class == 0
++        and np.allclose(weighted_probs.sum(), 1.0)
++        and np.allclose(probs, weighted_probs)
++    )
++
++    if passed:
++        print("PASS: leaf probabilities follow weighted statistics and hard labels use a stable raw-count tie-break.")
++    else:
++        print("FAIL: weighted leaf behavior is inconsistent.")
++
++    print("=" * 60)
++    return passed
++
++
++def test_bworf_parameter_defaults():
++    """
++    Unit test to verify the BWORF wrapper exposes the intended defaults.
++    """
++    print("=" * 60)
++    print("TEST: BWORF Wrapper Defaults")
++    print("=" * 60)
++
++    model = BWORFClassifier()
++    print(f"weighted_bootstrap={model.weighted_bootstrap}")
++    print(f"n_tries={model.n_tries}")
++
++    passed = (model.weighted_bootstrap is True and model.n_tries == 10)
++
++    if passed:
++        print("PASS: wrapper defaults match intended BWORF settings.")
++    else:
++        print("FAIL: wrapper defaults do not match intended BWORF settings.")
++
++    print("=" * 60)
++    return passed
++
++
++# ==============================================================================
++# Public API
++# ==============================================================================
++
++__all__ = [
++    "BWORFClassifier",
++    "ObliqueRandomForestMulti",
++    "ObliqueDecisionTreeMulti",
++]
++
++
++if __name__ == "__main__":
++    import sys
++    
++    # Simple CLI: 
++    #   python bworf_with_mi.py test_debug            - test standard bootstrap
++    #   python bworf_with_mi.py test_debug weighted   - test weighted bootstrap
++    #   python bworf_with_mi.py test_l1               - test l1_strength robustness
++    #   python bworf_with_mi.py test_leaf             - test weighted leaf consistency
++    #   python bworf_with_mi.py test_defaults         - test BWORF wrapper defaults
++    if len(sys.argv) > 1 and sys.argv[1] == "test_debug":
++        test_weighted = (len(sys.argv) > 2 and sys.argv[2] == "weighted")
++        test_debug_trace(test_weighted_bootstrap=test_weighted)
++    elif len(sys.argv) > 1 and sys.argv[1] == "test_l1":
++        test_l1_strength_robustness()
++    elif len(sys.argv) > 1 and sys.argv[1] == "test_leaf":
++        test_weighted_leaf_consistency()
++    elif len(sys.argv) > 1 and sys.argv[1] == "test_defaults":
++        test_bworf_parameter_defaults()
++    else:
++        main() 

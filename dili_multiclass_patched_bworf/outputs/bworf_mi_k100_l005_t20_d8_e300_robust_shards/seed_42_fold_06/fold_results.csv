@@ -1,0 +1,2 @@
+dataset,seed,fold,model_name,n_train,n_test,class0_train,class1_train,class2_train,class0_test,class1_test,class2_test,fit_time_sec,predict_time_sec,accuracy,balanced_accuracy,macro_f1,macro_recall,weighted_f1,mcc,macro_auroc_ovr,macro_auprc_ovr,log_loss
+dili_multiclass,42,6,bworf_mi,517,57,300,91,126,33,10,14,64120.63598748483,0.25143956393003464,0.43859649122807015,0.39494949494949494,0.3842208245981831,0.39494949494949494,0.47313987274265334,0.15371226949906427,0.5530067171086469,0.43350925101841864,1.0791792159991835

@@ -1,0 +1,81 @@
+{
+  "version": "v4",
+  "master_seed": 12345,
+  "n_cores": 48,
+  "shard_id": 0,
+  "n_shards": 4,
+  "grid": {
+    "h2": [
+      0.005,
+      0.01,
+      0.025,
+      0.05,
+      0.1,
+      0.15,
+      0.2
+    ],
+    "p": [
+      1000
+    ],
+    "n": [
+      500,
+      2500
+    ],
+    "m": [
+      2,
+      5,
+      10
+    ],
+    "rho": [
+      0.2,
+      0.8
+    ],
+    "signal_ratio": [
+      "inf",
+      1.0,
+      0.5
+    ],
+    "maf_type": "fixed",
+    "maf_fixed": 0.3,
+    "case_control_ratio": 1.0
+  },
+  "holdout_seeds": [
+    42,
+    0,
+    12,
+    100,
+    90
+  ],
+  "test_size": 0.3,
+  "n_replicates": 5,
+  "total_scenarios": 252,
+  "shard_scenarios": 63,
+  "methods": [
+    "rf",
+    "orf",
+    "bworf"
+  ],
+  "model_params": {
+    "rf": {
+      "n_estimators": 100
+    },
+    "orf": {
+      "n_estimators": 100,
+      "available": true
+    },
+    "bworf": {
+      "n_estimators": 100,
+      "l1_strength": 1.0,
+      "weighted_bootstrap": true,
+      "available": true
+    }
+  },
+  "perm_importance": {
+    "n_repeats": 1,
+    "subsample_n": 500,
+    "scoring": "roc_auc",
+    "topk": 20
+  },
+  "timestamp_utc": "2026-03-15T03:45:10.316658+00:00",
+  "sklearn_version": "1.6.1"
+}

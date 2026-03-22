@@ -1,0 +1,17 @@
+
+=====================================================================
+This module is only for creating or activating Python environments:
+$ mamba create -n myenv -c conda-forge python=3 <package_name>
+$ source activate myenv
+
+Only run "pip install" after activating an environment.
+Running pip without activating an environment is known to cause issues.
+
+To list available environments:
+$ mamba info --envs
+
+Other uses are not tested. More info: https://links.asu.edu/solpy
+=====================================================================
+
+  
+[2026-03-20T11:12:38.447] error: *** JOB 48961076 ON sc040 CANCELLED AT 2026-03-20T11:12:38 DUE to SIGNAL Terminated ***

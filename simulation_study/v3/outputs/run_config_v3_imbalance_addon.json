@@ -1,0 +1,90 @@
+{
+  "version": "v3_imbalance_addon",
+  "master_seed": 12345,
+  "n_cores": 16,
+  "shard_id": 0,
+  "n_shards": 1,
+  "grid": {
+    "h2": [
+      0.05,
+      0.1
+    ],
+    "p": [
+      1000
+    ],
+    "n": [
+      500,
+      2500
+    ],
+    "m": [
+      5
+    ],
+    "rho": [
+      0.2,
+      0.8
+    ],
+    "signal_ratio": [
+      1.0
+    ],
+    "maf_type": "fixed",
+    "maf_fixed": 0.3,
+    "case_control_ratio": [
+      0.2,
+      0.1
+    ]
+  },
+  "holdout_seeds": [
+    42,
+    0,
+    12,
+    100,
+    90
+  ],
+  "test_size": 0.3,
+  "n_replicates": 3,
+  "total_scenarios": 16,
+  "shard_scenarios": 16,
+  "methods": [
+    "rf",
+    "orf",
+    "bworf_uniform",
+    "bworf_weighted"
+  ],
+  "model_params": {
+    "rf": {
+      "n_estimators": 300
+    },
+    "orf": {
+      "n_estimators": 300,
+      "available": true
+    },
+    "bworf_uniform": {
+      "n_estimators": 300,
+      "weighted_bootstrap": false,
+      "available": true
+    },
+    "bworf_weighted": {
+      "n_estimators": 300,
+      "weighted_bootstrap": true,
+      "available": true
+    }
+  },
+  "perm_importance": {
+    "n_repeats": 1,
+    "subsample_n": 500,
+    "scoring": "roc_auc",
+    "topk": 20
+  },
+  "metrics": [
+    "auc",
+    "auprc",
+    "f1",
+    "balanced_acc",
+    "brier",
+    "mean_rank_causal",
+    "median_rank_causal",
+    "recall_at_20"
+  ],
+  "timestamp_utc": "2026-02-13T02:15:42.539248+00:00",
+  "sklearn_version": "1.6.1"
+}

@@ -1,0 +1,36 @@
+{
+  "source_merged_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_merged_20260313_053906",
+  "plots_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_merged_20260313_053906/plots_refined",
+  "main_boxplot_metrics": [
+    "Accuracy",
+    "Balanced Accuracy",
+    "Macro F1",
+    "Macro Recall",
+    "Macro AUROC",
+    "Macro AUPRC"
+  ],
+  "excluded_from_main_boxplot": [
+    "MCC",
+    "Log Loss"
+  ],
+  "created_files": [
+    "metric_boxplots_main_refined.png",
+    "metric_boxplots_main_refined.pdf",
+    "mcc_boxplot_refined.png",
+    "mcc_boxplot_refined.pdf",
+    "roc_ovr_3panel_refined.png",
+    "roc_ovr_3panel_refined.pdf",
+    "pr_ovr_3panel_refined.png",
+    "pr_ovr_3panel_refined.pdf",
+    "confusion_matrices_pooled_refined.png",
+    "confusion_matrices_pooled_refined.pdf",
+    "summary_metrics_table.csv",
+    "model_color_map.json",
+    "plot_manifest.json"
+  ],
+  "optional_files": [
+    "mi_top_features_barplot_refined.png",
+    "mi_top_features_barplot_refined.pdf"
+  ],
+  "top_mi_n": 20
+}

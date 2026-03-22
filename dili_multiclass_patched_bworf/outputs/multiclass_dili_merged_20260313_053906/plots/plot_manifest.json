@@ -1,0 +1,32 @@
+{
+  "source_merged_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_merged_20260313_053906",
+  "plots_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_merged_20260313_053906/plots",
+  "created_files": [
+    "metric_boxplots_main.png",
+    "metric_boxplots_main.pdf",
+    "roc_ovr_3panel.png",
+    "roc_ovr_3panel.pdf",
+    "pr_ovr_3panel.png",
+    "pr_ovr_3panel.pdf",
+    "confusion_matrices_pooled.png",
+    "confusion_matrices_pooled.pdf",
+    "summary_metrics_table.csv",
+    "model_color_map.json",
+    "plot_manifest.json"
+  ],
+  "optional_files": [
+    "mi_top_features_barplot.png",
+    "mi_top_features_barplot.pdf"
+  ],
+  "top_mi_n": 20,
+  "model_order": [
+    "RF",
+    "Logistic Regression",
+    "SVM (RBF)",
+    "XGBoost",
+    "Naive Bayes",
+    "ORF-style",
+    "BWORF",
+    "BWORF + MI"
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "dataset_name": "heart_failure",
+  "file": "heart_failure.csv.gz",
+  "target": "DEATH_EVENT",
+  "categorical_cols": [],
+  "task": "binary",
+  "n_samples": 299,
+  "n_features": 12,
+  "n_classes": 2,
+  "label_mapping": {
+    "0": 0,
+    "1": 1
+  },
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "n_splits": 10,
+  "model": "orf_style",
+  "top_k_used": 0,
+  "cli_args": {
+    "data_dir": "datasets",
+    "out_dir": "outputs",
+    "datasets": "heart_failure",
+    "models": "orf_style",
+    "n_splits": 10,
+    "seeds": "42,43,44,45,46",
+    "n_jobs": 8,
+    "rf_n_estimators": 100,
+    "rf_max_depth": 6,
+    "bworf_n_estimators": 100,
+    "bworf_max_depth": 6,
+    "bworf_min_samples_split": 10,
+    "bworf_min_samples_leaf": 1,
+    "bworf_l1_strength": 0.2,
+    "bworf_bootstrap_temperature": 1.0,
+    "bworf_n_tries": 10,
+    "bworf_top_k_override": null,
+    "drop_incomplete_oof": false
+  },
+  "package_versions": {
+    "python": "3.10.19",
+    "platform": "Linux-4.18.0-553.77.1.el8_10.x86_64-x86_64-with-glibc2.28",
+    "numpy": "1.26.4",
+    "pandas": "2.3.3",
+    "scikit-learn": "1.6.1"
+  },
+  "timestamp": "2026-03-07T22:53:36.242302+00:00"
+}

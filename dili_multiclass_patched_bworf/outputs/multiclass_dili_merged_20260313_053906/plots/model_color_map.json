@@ -1,0 +1,10 @@
+{
+  "RF": "#1f77b4",
+  "Logistic Regression": "#ff7f0e",
+  "SVM (RBF)": "#2ca02c",
+  "XGBoost": "#d62728",
+  "Naive Bayes": "#9467bd",
+  "ORF-style": "#8c564b",
+  "BWORF": "#e377c2",
+  "BWORF + MI": "#7f7f7f"
+}

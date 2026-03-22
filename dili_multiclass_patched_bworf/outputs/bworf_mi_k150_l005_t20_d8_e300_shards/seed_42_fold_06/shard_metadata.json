@@ -1,0 +1,44 @@
+{
+  "dataset": "dili_multiclass",
+  "run_name": "bworf_mi_k150_l005_t20_d8_e300",
+  "model": "bworf_mi",
+  "seed": 42,
+  "fold": 6,
+  "task_id": 5,
+  "n_splits": 10,
+  "seeds_all": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "n_train": 517,
+  "n_test": 57,
+  "class_counts_train": {
+    "0": 300,
+    "1": 91,
+    "2": 126
+  },
+  "class_counts_test": {
+    "0": 33,
+    "1": 10,
+    "2": 14
+  },
+  "fit_time_sec": 26271.45499221608,
+  "predict_time_sec": 0.2253829762339592,
+  "created_at": "2026-03-21T15:45:40",
+  "success": true,
+  "hyperparameters": {
+    "mi_top_k": 150,
+    "oblique_n_estimators": 300,
+    "oblique_max_depth": 8,
+    "oblique_min_samples_split": 10,
+    "oblique_min_samples_leaf": 1,
+    "oblique_l1_strength": 0.05,
+    "oblique_n_tries": 20,
+    "oblique_bootstrap_temperature": 1.0,
+    "oblique_scale_mode": "standard",
+    "n_jobs": 2
+  }
+}

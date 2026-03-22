@@ -1,0 +1,112 @@
+{
+  "dataset": "dili_multiclass",
+  "data_path": "/home/chungyua/dili_multiclass_patched_bworf/data/dili_multiclass.csv",
+  "feature_names_path": "/home/chungyua/dili_multiclass_patched_bworf/data/dili_multiclass_feature_names.csv",
+  "output_root": "/home/chungyua/dili_multiclass_patched_bworf/outputs",
+  "run_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_baselines_20260312_092014",
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ],
+  "n_splits": 10,
+  "models": [
+    "rf",
+    "lr",
+    "svm_rbf",
+    "xgb",
+    "naive_bayes"
+  ],
+  "mi_top_k": 50,
+  "target_col": "y_3class",
+  "id_col": "USER_ID",
+  "feature_rule": "columns matching D###",
+  "excluded_from_modeling": [
+    "Likelihood_letter_base",
+    "Likelihood_letter_raw",
+    "USER_ID",
+    "y_3class",
+    "y_3class_name"
+  ],
+  "class_order": [
+    0,
+    1,
+    2
+  ],
+  "notes": {
+    "runner_plotting_separate": true,
+    "hard_predictions_from_model_predict": true,
+    "probabilities_from_predict_proba": true,
+    "full_split_manifest": true,
+    "oblique_models_scaled": true,
+    "oblique_scaling_rationale": "Raw Mold2 values can exceed ~1e30; fold-local scaling stabilizes liblinear-based oblique split fitting."
+  },
+  "hyperparameters": {
+    "rf": {
+      "n_estimators": 100,
+      "max_depth": 6,
+      "min_samples_split": 10,
+      "min_samples_leaf": 1,
+      "max_features": "sqrt"
+    },
+    "orf_style": {
+      "n_estimators": 100,
+      "max_depth": 6,
+      "min_samples_split": 10,
+      "min_samples_leaf": 1,
+      "l1_strength": 0.2,
+      "weighted_bootstrap": false,
+      "bootstrap_temperature": 1.0,
+      "n_tries": 10
+    },
+    "bworf_no_mi": {
+      "n_estimators": 100,
+      "max_depth": 6,
+      "min_samples_split": 10,
+      "min_samples_leaf": 1,
+      "l1_strength": 0.2,
+      "weighted_bootstrap": true,
+      "bootstrap_temperature": 1.0,
+      "n_tries": 10
+    },
+    "bworf_mi": {
+      "n_estimators": 100,
+      "max_depth": 6,
+      "min_samples_split": 10,
+      "min_samples_leaf": 1,
+      "l1_strength": 0.2,
+      "weighted_bootstrap": true,
+      "bootstrap_temperature": 1.0,
+      "n_tries": 10,
+      "mi_top_k": 50
+    },
+    "lr": {
+      "solver": "lbfgs",
+      "C": 1.0,
+      "max_iter": 4000
+    },
+    "svm_rbf": {
+      "kernel": "rbf",
+      "C": 1.0,
+      "gamma": "scale",
+      "probability": true
+    },
+    "xgb": {
+      "n_estimators": 100,
+      "max_depth": 6,
+      "learning_rate": 0.1,
+      "subsample": 1.0,
+      "colsample_bytree": 1.0,
+      "objective": "multi:softprob",
+      "eval_metric": "mlogloss",
+      "num_class": 3
+    },
+    "naive_bayes": {
+      "type": "GaussianNB"
+    }
+  },
+  "created_at": "2026-03-12T09:26:34",
+  "script_name": "run_multiclass_dili_patched_benchmark.py"
+}

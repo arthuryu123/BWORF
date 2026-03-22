@@ -1,0 +1,14 @@
+{
+  "created_at": "2026-03-21T19:04:30",
+  "shards_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/bworf_mi_k100_l005_t20_d8_e300_shards",
+  "output_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/bworf_mi_k100_l005_t20_d8_e300_merged_20260321_190430",
+  "n_shards_found": 50,
+  "expected_shards": 50,
+  "notes": {
+    "fold_results": "concatenated from shard fold_results.csv",
+    "oof_predictions": "concatenated from shard oof_predictions.csv",
+    "summary_metrics": "recomputed from merged fold_results",
+    "confusion_matrices": "recomputed from merged oof_predictions",
+    "sanity_check": "recomputed from merged fold_results/oof_predictions"
+  }
+}

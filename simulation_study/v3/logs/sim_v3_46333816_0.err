@@ -1,0 +1,3 @@
+[2026-02-02T06:27:28.172] error: slurm_get_node_energy: Socket timed out on send/recv operation
+[2026-02-02T06:27:28.183] error: _get_joules_task: can't get info from slurmd
+[2026-02-02T23:58:54.032] error: *** JOB 46333818 ON sc018 CANCELLED AT 2026-02-02T23:58:54 DUE TO TIME LIMIT ***

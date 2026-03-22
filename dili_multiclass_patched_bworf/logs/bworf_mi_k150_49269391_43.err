@@ -1,0 +1,32 @@
+
+=====================================================================
+This module is only for creating or activating Python environments:
+$ mamba create -n myenv -c conda-forge python=3 <package_name>
+$ source activate myenv
+
+Only run "pip install" after activating an environment.
+Running pip without activating an environment is known to cause issues.
+
+To list available environments:
+$ mamba info --envs
+
+Other uses are not tested. More info: https://links.asu.edu/solpy
+=====================================================================
+
+  
+Traceback (most recent call last):
+  File "/home/chungyua/dili_multiclass_patched_bworf/code/run_multiclass_dili_shard.py", line 552, in <module>
+  File "/home/chungyua/dili_multiclass_patched_bworf/code/run_multiclass_dili_shard.py", line 504, in main
+  File "/home/chungyua/.conda/envs/sim_orf/lib/python3.10/site-packages/pandas/util/_decorators.py", line 333, in wrapper
+    return func(*args, **kwargs)
+  File "/home/chungyua/.conda/envs/sim_orf/lib/python3.10/site-packages/pandas/core/generic.py", line 3989, in to_csv
+    return DataFrameRenderer(formatter).to_csv(
+  File "/home/chungyua/.conda/envs/sim_orf/lib/python3.10/site-packages/pandas/io/formats/format.py", line 1014, in to_csv
+    csv_formatter.save()
+  File "/home/chungyua/.conda/envs/sim_orf/lib/python3.10/site-packages/pandas/io/formats/csvs.py", line 251, in save
+    with get_handle(
+  File "/home/chungyua/.conda/envs/sim_orf/lib/python3.10/site-packages/pandas/io/common.py", line 749, in get_handle
+    check_parent_directory(str(handle))
+  File "/home/chungyua/.conda/envs/sim_orf/lib/python3.10/site-packages/pandas/io/common.py", line 616, in check_parent_directory
+    raise OSError(rf"Cannot save file into a non-existent directory: '{parent}'")
+OSError: Cannot save file into a non-existent directory: '/home/chungyua/dili_multiclass_patched_bworf/outputs/bworf_mi_k150_l005_t20_d8_e300_shards/seed_46_fold_04'

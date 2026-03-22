@@ -1,0 +1,11 @@
+[2026-02-03T11:24:25.506] error: slurm_get_node_energy: Socket timed out on send/recv operation
+[2026-02-03T11:24:25.517] error: _get_joules_task: can't get info from slurmd
+[2026-02-03T11:26:25.505] error: slurm_get_node_energy: Socket timed out on send/recv operation
+[2026-02-03T11:26:25.505] error: _get_joules_task: can't get info from slurmd
+[2026-02-03T11:28:25.437] error: slurm_get_node_energy: Socket timed out on send/recv operation
+[2026-02-03T11:28:25.438] error: _get_joules_task: can't get info from slurmd
+[2026-02-03T11:57:25.492] error: slurm_get_node_energy: Socket timed out on send/recv operation
+[2026-02-03T11:57:25.493] error: _get_joules_task: can't get info from slurmd
+[2026-02-03T23:52:25.494] error: slurm_get_node_energy: Socket timed out on send/recv operation
+[2026-02-03T23:52:25.494] error: _get_joules_task: can't get info from slurmd
+[2026-02-04T00:30:30.051] error: *** JOB 46402934 ON sc071 CANCELLED AT 2026-02-04T00:30:30 DUE TO TIME LIMIT ***

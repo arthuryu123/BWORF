@@ -1,0 +1,21 @@
+{
+  "dataset": "dili_multiclass",
+  "n_samples": 574,
+  "n_features": 777,
+  "n_models": 3,
+  "n_seeds": 5,
+  "n_folds": 10,
+  "class_counts": {
+    "0": 333,
+    "1": 101,
+    "2": 140
+  },
+  "expected_fold_rows": 150,
+  "actual_fold_rows": 150,
+  "fold_rows_match_expected": true,
+  "expected_oof_rows": 8610,
+  "actual_oof_rows": 8610,
+  "oof_rows_match_expected": true,
+  "duplicate_oof_key_count": 0,
+  "oof_probability_sum_max_abs_error": 4.440892098500626e-16
+}

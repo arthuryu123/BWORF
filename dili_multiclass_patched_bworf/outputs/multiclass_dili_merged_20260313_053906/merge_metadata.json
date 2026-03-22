@@ -1,0 +1,25 @@
+{
+  "created_at": "2026-03-13T05:39:07",
+  "baseline_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_baselines_20260312_092014",
+  "oblique_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_oblique_20260312_092910",
+  "output_dir": "/home/chungyua/dili_multiclass_patched_bworf/outputs/multiclass_dili_merged_20260313_053906",
+  "merged_models": [
+    "bworf_mi",
+    "bworf_no_mi",
+    "lr",
+    "naive_bayes",
+    "orf_style",
+    "rf",
+    "svm_rbf",
+    "xgb"
+  ],
+  "notes": {
+    "fold_results": "concatenated",
+    "oof_predictions": "concatenated",
+    "summary_metrics": "recomputed from merged fold_results",
+    "confusion_matrices": "recomputed from merged oof_predictions",
+    "sanity_check": "recomputed from merged fold_results/oof_predictions",
+    "split_manifest": "verified against both runs; single canonical copy retained",
+    "mi_selected_features": "carried from oblique run only; baseline MI file may be empty"
+  }
+}

@@ -1,0 +1,35 @@
+
+=====================================================================
+This module is only for creating or activating Python environments:
+$ mamba create -n myenv -c conda-forge python=3 <package_name>
+$ source activate myenv
+
+Only run "pip install" after activating an environment.
+Running pip without activating an environment is known to cause issues.
+
+To list available environments:
+$ mamba info --envs
+
+Other uses are not tested. More info: https://links.asu.edu/solpy
+=====================================================================
+
+  
+usage: run_multiclass_dili_shard.py [-h] --data_path DATA_PATH
+                                    [--feature_names_path FEATURE_NAMES_PATH]
+                                    --output_root OUTPUT_ROOT --run_name
+                                    RUN_NAME [--n_splits N_SPLITS]
+                                    [--seeds SEEDS] --model
+                                    {rf,orf_style,lr,svm_rbf,xgb,naive_bayes,bworf_no_mi,bworf_mi}
+                                    [--seed SEED] [--fold FOLD]
+                                    [--task_id TASK_ID] [--n_jobs N_JOBS]
+                                    [--mi_top_k MI_TOP_K]
+                                    [--keep_model_stdout]
+                                    [--oblique_n_estimators OBLIQUE_N_ESTIMATORS]
+                                    [--oblique_max_depth OBLIQUE_MAX_DEPTH]
+                                    [--oblique_min_samples_split OBLIQUE_MIN_SAMPLES_SPLIT]
+                                    [--oblique_min_samples_leaf OBLIQUE_MIN_SAMPLES_LEAF]
+                                    [--oblique_l1_strength OBLIQUE_L1_STRENGTH]
+                                    [--oblique_n_tries OBLIQUE_N_TRIES]
+                                    [--oblique_bootstrap_temperature OBLIQUE_BOOTSTRAP_TEMPERATURE]
+                                    [--oblique_scale_mode {standard,robust,none}]
+run_multiclass_dili_shard.py: error: the following arguments are required: --data_path, --output_root, --run_name, --model
