@@ -1,0 +1,7 @@
+{
+  "bundle_path": "/home/chungyua/Thesis/dili_multiclass_patched_bworf/lime_artifacts/bworf_mi_seed43/lime_final_bworf_mi_seed43.joblib",
+  "selected_csv": "/home/chungyua/Thesis/dili_multiclass_patched_bworf/lime_artifacts/bworf_mi_seed43/lime_selected_instances.csv",
+  "num_features": 10,
+  "num_samples": 5000,
+  "n_cases": 9
+}

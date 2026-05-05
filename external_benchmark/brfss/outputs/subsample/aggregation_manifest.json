@@ -1,0 +1,49 @@
+{
+  "dataset_name": "heart_attack_2022_brfss",
+  "out_dir": "outputs_heart2022_subsample",
+  "n_shards": 25,
+  "shard_paths": [
+    "bworf/seed_123/heart_attack_2022_brfss/fold_results.csv",
+    "bworf/seed_13/heart_attack_2022_brfss/fold_results.csv",
+    "bworf/seed_2025/heart_attack_2022_brfss/fold_results.csv",
+    "bworf/seed_42/heart_attack_2022_brfss/fold_results.csv",
+    "bworf/seed_77/heart_attack_2022_brfss/fold_results.csv",
+    "lr/seed_123/heart_attack_2022_brfss/fold_results.csv",
+    "lr/seed_13/heart_attack_2022_brfss/fold_results.csv",
+    "lr/seed_2025/heart_attack_2022_brfss/fold_results.csv",
+    "lr/seed_42/heart_attack_2022_brfss/fold_results.csv",
+    "lr/seed_77/heart_attack_2022_brfss/fold_results.csv",
+    "orf/seed_123/heart_attack_2022_brfss/fold_results.csv",
+    "orf/seed_13/heart_attack_2022_brfss/fold_results.csv",
+    "orf/seed_2025/heart_attack_2022_brfss/fold_results.csv",
+    "orf/seed_42/heart_attack_2022_brfss/fold_results.csv",
+    "orf/seed_77/heart_attack_2022_brfss/fold_results.csv",
+    "rf/seed_123/heart_attack_2022_brfss/fold_results.csv",
+    "rf/seed_13/heart_attack_2022_brfss/fold_results.csv",
+    "rf/seed_2025/heart_attack_2022_brfss/fold_results.csv",
+    "rf/seed_42/heart_attack_2022_brfss/fold_results.csv",
+    "rf/seed_77/heart_attack_2022_brfss/fold_results.csv",
+    "xgb/seed_123/heart_attack_2022_brfss/fold_results.csv",
+    "xgb/seed_13/heart_attack_2022_brfss/fold_results.csv",
+    "xgb/seed_2025/heart_attack_2022_brfss/fold_results.csv",
+    "xgb/seed_42/heart_attack_2022_brfss/fold_results.csv",
+    "xgb/seed_77/heart_attack_2022_brfss/fold_results.csv"
+  ],
+  "models_found": [
+    "bworf",
+    "lr",
+    "orf",
+    "rf",
+    "xgb"
+  ],
+  "seeds_found": [
+    13,
+    42,
+    77,
+    123,
+    2025
+  ],
+  "total_fold_results_rows": 250,
+  "total_oof_rows": 100000,
+  "timestamp": "2026-04-27T18:40:04.177166+00:00"
+}

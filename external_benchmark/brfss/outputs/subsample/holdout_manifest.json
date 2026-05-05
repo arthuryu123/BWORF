@@ -1,0 +1,25 @@
+{
+  "dataset": "heart_attack_2022_brfss",
+  "modeling_csv": "data/cleaned/heart_attack_2022_brfss.csv.gz",
+  "holdout_csv": "data/cleaned/heart_attack_2022_brfss_holdout.csv.gz",
+  "models": [
+    "lr",
+    "rf",
+    "xgb",
+    "orf"
+  ],
+  "seeds": [
+    13,
+    42,
+    77,
+    123,
+    2025
+  ],
+  "n_train": 4000,
+  "n_holdout": 1000,
+  "label_mapping": {
+    "0": 0,
+    "1": 1
+  },
+  "timestamp": "2026-04-28T02:02:36.877001+00:00"
+}
