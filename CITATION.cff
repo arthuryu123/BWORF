@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "Citation to be updated after publication. Until then, please cite the repository directly."
+type: software
+title: "BWORF: Bootstrap-Weighted Oblique Random Forest"
+authors:
+  - family-names: "Yu"
+    given-names: "Chung-Yuan"
+    affiliation: "Arizona State University"
+repository-code: "https://github.com/arthuryu123/BWORF"
+license: MIT
+keywords:
+  - machine-learning
+  - random-forest
+  - oblique-decision-trees
+  - imbalanced-classification
+  - tabular-data
+  - bioinformatics
