@@ -1,0 +1,10 @@
+sample_index,USER_ID,selection_category,true_class,selected_oof_pred_class,final_refit_pred_class,explained_class,final_refit_pred_proba,n_features_shown
+296,5719,borderline_correct,0,0,0,0,0.4500000000000001,10
+273,3911,high_confidence_correct,0,0,0,0,0.7,10
+382,11953884,notable_error,0,1,1,1,0.3516666666666666,10
+166,3883,borderline_correct,1,1,1,1,0.5833333333333334,10
+163,3749,high_confidence_correct,1,1,1,1,0.6366666666666668,10
+179,5070,notable_error,1,2,2,2,0.39,10
+39,657298,borderline_correct,2,2,2,2,0.4816666666666667,10
+79,3763,high_confidence_correct,2,2,2,2,0.5,10
+112,60838,notable_error,2,0,0,0,0.4733333333333333,10
