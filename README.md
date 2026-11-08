@@ -6,6 +6,11 @@ BWORF is a tree-based ensemble method for tabular classification that combines t
 
 ---
 
+## DILI model code
+
+- [Paper implementation](dili_multiclass_patched_bworf/paper_model/bworf_with_mi.py): BWORF model code used for the primary multiclass DILI analysis in the BioData Mining paper.
+- [Thesis implementation](dili_multiclass_patched_bworf/code/bworf_with_mi.py): BWORF model code for the earlier thesis benchmark.
+
 ## Repository contents
 
 This repository contains four self-contained sub-projects, each with its own README documenting that sub-project's protocol, hyperparameters, results, and reproduction instructions.
